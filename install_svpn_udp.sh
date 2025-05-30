@@ -1,17 +1,11 @@
 #!/usr/bin/env bash
-#
-# Try `install_agnudp.sh --help` for usage.
-#
-# (c) 2023 Khaled AGN
-#
-
 set -e
 
 # Prompt for Domain Name before installation
 prompt_for_domain() {
     local default_domain="svpn.udp.com"
     echo
-    echo -n "Enter your domain for this server (default: $default_domain): "
+    echo -n "Enter your IP or DNS for this server (default: $default_domain): "
     read -r input_domain
     if [[ -z "$input_domain" ]]; then
         DOMAIN="$default_domain"
@@ -453,18 +447,18 @@ check_environment() {
 
 show_usage_and_exit() {
     echo
-    echo -e "\t$(tbold)$SCRIPT_NAME$(treset) - AGN-UDP server install script"
+    echo -e "\t$(tbold)$SCRIPT_NAME$(treset) - SVPN-UDP server install script"
     echo
     echo -e "Usage:"
     echo
-    echo -e "$(tbold)Install AGN-UDP$(treset)"
+    echo -e "$(tbold)Install SVPN-UDP$(treset)"
     echo -e "\t$0 [ -f | -l <file> | --version <version> ]"
     echo -e "Flags:"
     echo -e "\t-f, --force\tForce re-install latest or specified version even if it has been installed."
-    echo -e "\t-l, --local <file>\tInstall specified AGN-UDP binary instead of download it."
+    echo -e "\t-l, --local <file>\tInstall specified SVPN-UDP binary instead of download it."
     echo -e "\t--version <version>\tInstall specified version instead of the latest."
     echo
-    echo -e "$(tbold)Remove AGN-UDP$(treset)"
+    echo -e "$(tbold)Remove SVPN-UDP$(treset)"
     echo -e "\t$0 --remove"
     echo
     echo -e "$(tbold)Check for the update$(treset)"
@@ -482,7 +476,7 @@ tpl_hysteria_server_service_base() {
 
     cat << EOF
 [Unit]
-Description=AGN-UDP Service
+Description=SVPN-UDP Service
 After=network.target
 
 [Service]
@@ -659,18 +653,18 @@ perform_install_hysteria_home_legacy() {
 }
 
 perform_install_manager_script() {
-    local _manager_script="/usr/local/bin/agnudp_manager.sh"
-    local _symlink_path="/usr/local/bin/agnudp"
+    local _manager_script="/usr/local/bin/svpn_udp_manager.sh"
+    local _symlink_path="/usr/local/bin/svpnudp"
     
     echo "Downloading manager script..."
     curl -o "$_manager_script" "https://raw.githubusercontent.com/sansoe2022/udp/refs/heads/main/svpn_udp_manager.sh"
     chmod +x "$_manager_script"
     
-    echo "Creating symbolic link to run the manager script using 'agnudp' command..."
+    echo "Creating symbolic link to run the manager script using 'svpnudp' command..."
     ln -sf "$_manager_script" "$_symlink_path"
     
     echo "Manager script installed at $_manager_script"
-    echo "You can now run the manager using the 'agnudp' command."
+    echo "You can now run the manager using the 'svpnudp' command."
 }
 
 is_hysteria_installed() {
@@ -737,24 +731,23 @@ perform_install() {
 
     if [[ -n "$_is_fresh_install" ]]; then
         echo
-        echo -e "$(tbold)Congratulations! AGN-UDP has been successfully installed on your server.$(treset)"
-        echo "Use 'agnudp' command to access the manager."
+        echo -e "$(tbold)Congratulations! SVPN-UDP has been successfully installed on your server.$(treset)"
+        echo "Use 'svpnudp' command to access the manager."
 
         echo
-        echo -e "$(tbold)Client app AGN INJECTOR:$(treset)"
-        echo -e "$(tblue)https://play.google.com/store/apps/details?id=com.agn.injector$(treset)"
+        echo -e "$(tbold)Client app SVPN Connect:$(treset)"
+        echo -e "$(tblue)https://play.google.com/store/apps/details?id=com.svpnmm.mmdev"
         echo
         echo -e "Follow me!"
         echo
-        echo -e "\t+ Check out my website at $(tblue)https://www.khaledagn.me$(treset)"
-        echo -e "\t+ Follow me on Telegram: $(tblue)https://t.me/khaledagn$(treset)"
-        echo -e "\t+ Follow me on Facebook: $(tblue)https://facebook.com/itskhaledagn$(treset)"
+        echo -e "\t+ Follow me on Telegram: $(tblue)https://t.me/sansoe2021$(treset)"
+        echo -e "\t+ Follow me on Facebook: $(tblue)https://www.facebook.com/share/15KzEGz3Es/"
         echo
     else
         restart_running_services
         start_services
         echo
-        echo -e "$(tbold)AGN-UDP has been successfully updated to $VERSION.$(treset)"
+        echo -e "$(tbold)SVPN-UDP has been successfully updated to $VERSION.$(treset)"
         echo
     fi
 }
@@ -797,7 +790,7 @@ setup_ssl() {
 }
 
 start_services() {
-    echo "Starting AGN-UDP"
+    echo "Starting SVPN-UDP"
     apt update
     sudo debconf-set-selections <<< "iptables-persistent iptables-persistent/autosave_v4 boolean true"
     sudo debconf-set-selections <<< "iptables-persistent iptables-persistent/autosave_v6 boolean true"
