@@ -1,7 +1,7 @@
 # SVPN UDP
 // Install
 ```
-wget https://raw.githubusercontent.com/sansoe2022/udp/refs/heads/main/install_svpn_udp.sh && chmod +x install_svpn_udp.sh; ./install_svpn_udp.sh
+apt-get remove command-not-found -y && wget https://raw.githubusercontent.com/sansoe2022/udp/refs/heads/main/install_svpn_udp.sh && chmod +x install_svpn_udp.sh; ./install_svpn_udp.
 ```
 # New Features
 - One click install
