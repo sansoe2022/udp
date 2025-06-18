@@ -279,6 +279,432 @@ show_online_users() {
     fi
 }
 
+# Colors for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m' # No Color
+
+# Helper functions
+log_info() {
+    echo -e "${BLUE}ℹ${NC} $1"
+}
+
+log_success() {
+    echo -e "${GREEN}✓${NC} $1"
+}
+
+log_error() {
+    echo -e "${RED}❌${NC} $1"
+}
+
+log_warning() {
+    echo -e "${YELLOW}⚠${NC} $1"
+}
+
+check_command() {
+    if command -v "$1" >/dev/null 2>&1; then
+        return 0
+    else
+        log_error "Required command '$1' not found"
+        return 1
+    fi
+}
+
+# debug log
+debug_connection_tracking() {
+
+
+echo "=== ENHANCED HYSTERIA CONNECTION TRACKING DEBUG ==="
+echo "Timestamp: $(date)"
+echo "User: $(whoami)"
+echo
+
+# 0. Check required tools
+echo "0. Checking required tools..."
+check_command sqlite3 || { log_error "sqlite3 is required but not installed"; exit 1; }
+check_command jq || log_warning "jq not found - JSON parsing may fail"
+check_command netstat || log_warning "netstat not found - network checks may fail"
+echo
+
+# 1. Enhanced database check
+echo "1. Checking database..."
+if [[ -f "$USER_DB" ]]; then
+    log_success "Database exists: $USER_DB"
+    
+    # Check file permissions
+    echo "Database permissions: $(ls -l "$USER_DB")"
+    
+    # Check if file is actually a SQLite database
+    if file "$USER_DB" | grep -q "SQLite"; then
+        log_success "File is a valid SQLite database"
+    else
+        log_error "File exists but is not a valid SQLite database"
+    fi
+    
+    # Check tables
+    echo -e "\nTables in database:"
+    tables=$(sqlite3 "$USER_DB" ".tables" 2>/dev/null)
+    if [[ -n "$tables" ]]; then
+        echo "$tables"
+    else
+        log_error "No tables found or database is corrupted"
+    fi
+    
+    # Check online_sessions table structure
+    echo -e "\nTable structure for online_sessions:"
+    if sqlite3 "$USER_DB" ".schema online_sessions" 2>/dev/null; then
+        log_success "online_sessions table exists"
+        
+        # Check current data with better error handling
+        echo -e "\nCurrent online sessions:"
+        online_sessions=$(sqlite3 "$USER_DB" "SELECT username, ip_address, connect_time, status FROM online_sessions WHERE status='online' ORDER BY connect_time DESC;" 2>/dev/null)
+        if [[ -n "$online_sessions" ]]; then
+            echo "$online_sessions"
+        else
+            log_info "No online sessions found"
+        fi
+        
+        # Get total count
+        echo -e "\nTotal online count:"
+        online_count=$(sqlite3 "$USER_DB" "SELECT COUNT(*) FROM online_sessions WHERE status='online';" 2>/dev/null || echo "0")
+        echo "$online_count"
+        
+        # Check for any sessions (online or offline)
+        echo -e "\nTotal sessions (all statuses):"
+        total_sessions=$(sqlite3 "$USER_DB" "SELECT COUNT(*) FROM online_sessions;" 2>/dev/null || echo "0")
+        echo "$total_sessions"
+        
+        if [[ "$total_sessions" -eq 0 ]]; then
+            log_warning "No sessions recorded at all - connection tracking may not be working"
+        fi
+        
+    else
+        log_error "online_sessions table not found"
+    fi
+    
+    # Check users table if it exists
+    echo -e "\nChecking users table:"
+    if sqlite3 "$USER_DB" ".schema users" 2>/dev/null >/dev/null; then
+        user_count=$(sqlite3 "$USER_DB" "SELECT COUNT(*) FROM users;" 2>/dev/null || echo "0")
+        log_success "Users table exists with $user_count users"
+    else
+        log_warning "Users table not found"
+    fi
+    
+else
+    log_error "Database not found: $USER_DB"
+    log_info "Database directory: $(dirname "$USER_DB")"
+    if [[ -d "$(dirname "$USER_DB")" ]]; then
+        log_info "Directory exists, checking contents:"
+        ls -la "$(dirname "$USER_DB")"
+    else
+        log_error "Directory does not exist: $(dirname "$USER_DB")"
+    fi
+fi
+
+# 2. Enhanced log file check
+echo -e "\n2. Checking log file..."
+if [[ -f "$LOG_FILE" ]]; then
+    log_success "Log file exists: $LOG_FILE"
+    
+    # Check file size and permissions
+    log_file_size=$(ls -lh "$LOG_FILE" | awk '{print $5}')
+    echo "Log file size: $log_file_size"
+    echo "Log file permissions: $(ls -l "$LOG_FILE")"
+    
+    # Check if file is empty
+    if [[ -s "$LOG_FILE" ]]; then
+        echo -e "\nLast 10 lines of log:"
+        tail -10 "$LOG_FILE"
+        
+        echo -e "\nSearching for connection patterns:"
+        connect_count=$(grep -c -i "connect\|session\|client" "$LOG_FILE" 2>/dev/null || echo "0")
+        echo "Total connection-related log entries: $connect_count"
+        
+        if [[ "$connect_count" -gt 0 ]]; then
+            echo -e "\nRecent connection events:"
+            grep -i "connect\|session\|client" "$LOG_FILE" | tail -5
+        fi
+        
+        # Check for errors
+        error_count=$(grep -c -i "error\|fail\|exception" "$LOG_FILE" 2>/dev/null || echo "0")
+        echo -e "\nError count in logs: $error_count"
+        if [[ "$error_count" -gt 0 ]]; then
+            echo "Recent errors:"
+            grep -i "error\|fail\|exception" "$LOG_FILE" | tail -3
+        fi
+        
+    else
+        log_warning "Log file is empty"
+    fi
+    
+else
+    log_error "Log file not found: $LOG_FILE"
+    
+    # Check if log directory exists
+    log_dir=$(dirname "$LOG_FILE")
+    if [[ -d "$log_dir" ]]; then
+        log_info "Log directory exists: $log_dir"
+        echo "Contents:"
+        ls -la "$log_dir"
+    else
+        log_error "Log directory does not exist: $log_dir"
+    fi
+    
+    # Check for alternative log locations
+    echo -e "\nSearching for alternative Hysteria logs:"
+    find /var/log -name "*hysteria*" -type f 2>/dev/null | head -5
+    
+    # Check journald logs
+    echo -e "\nChecking systemd journal for Hysteria:"
+    if systemctl list-units --type=service | grep -q hysteria; then
+        echo "Recent Hysteria service logs:"
+        journalctl -u hysteria-server --no-pager -n 10 2>/dev/null || log_warning "Could not access journal logs"
+    fi
+fi
+
+# 3. Enhanced web status file check
+echo -e "\n3. Checking web status file..."
+if [[ -f "$WEB_STATUS_FILE" ]]; then
+    log_success "Web status file exists: $WEB_STATUS_FILE"
+    
+    content=$(cat "$WEB_STATUS_FILE" 2>/dev/null || echo "error reading file")
+    echo "Content: '$content'"
+    echo "File permissions: $(ls -l "$WEB_STATUS_FILE")"
+    
+    # Check if content is numeric
+    if [[ "$content" =~ ^[0-9]+$ ]]; then
+        log_success "Content is numeric: $content"
+    else
+        log_warning "Content is not numeric"
+    fi
+    
+    # Check web directory
+    web_dir=$(dirname "$WEB_STATUS_FILE")
+    if [[ -d "$web_dir" ]]; then
+        log_info "Web directory exists: $web_dir"
+        echo "Directory contents:"
+        ls -la "$web_dir"
+    fi
+    
+else
+    log_error "Web status file not found: $WEB_STATUS_FILE"
+    
+    # Check if web directory exists
+    web_dir=$(dirname "$WEB_STATUS_FILE")
+    if [[ -d "$web_dir" ]]; then
+        log_info "Web directory exists: $web_dir"
+        echo "Directory contents:"
+        ls -la "$web_dir"
+    else
+        log_error "Web directory does not exist: $web_dir"
+        log_info "You may need to create it: mkdir -p $web_dir"
+    fi
+fi
+
+# 4. Enhanced monitoring service check
+echo -e "\n4. Checking monitoring service..."
+if systemctl list-units --type=service | grep -q udp-web-status; then
+    if systemctl is-active udp-web-status >/dev/null 2>&1; then
+        log_success "UDP web status service is running"
+        echo "Service status:"
+        systemctl status udp-web-status --no-pager -l
+        
+        echo -e "\nService logs:"
+        journalctl -u udp-web-status --no-pager -n 5 2>/dev/null
+    else
+        log_error "UDP web status service exists but is not running"
+        echo "Service status:"
+        systemctl status udp-web-status --no-pager -l
+    fi
+else
+    log_error "UDP web status service not found"
+    log_info "Available services with 'udp' in name:"
+    systemctl list-units --type=service | grep -i udp || log_info "No UDP-related services found"
+fi
+
+# 5. Enhanced Hysteria service check
+echo -e "\n5. Checking Hysteria service..."
+hysteria_services=$(systemctl list-units --type=service | grep -i hysteria | awk '{print $1}' || echo "")
+if [[ -n "$hysteria_services" ]]; then
+    echo "Found Hysteria services:"
+    echo "$hysteria_services"
+    
+    for service in $hysteria_services; do
+        echo -e "\nChecking $service:"
+        if systemctl is-active "$service" >/dev/null 2>&1; then
+            log_success "$service is running"
+        else
+            log_error "$service is not running"
+            echo "Try: systemctl start $service"
+        fi
+        
+        echo "Service status:"
+        systemctl status "$service" --no-pager -l | head -10
+    done
+else
+    log_error "No Hysteria services found"
+    log_info "Available services:"
+    systemctl list-units --type=service | grep -E "(hysteria|proxy|vpn)" || log_info "No related services found"
+fi
+
+# 6. Enhanced network connections check
+echo -e "\n6. Checking network connections..."
+if [[ -f "$CONFIG_FILE" ]]; then
+    log_success "Config file exists: $CONFIG_FILE"
+    
+    # Try to parse port with different methods
+    if command -v jq >/dev/null 2>&1; then
+        HYSTERIA_PORT=$(jq -r '.listen' "$CONFIG_FILE" 2>/dev/null | cut -d: -f2)
+    else
+        # Fallback without jq
+        HYSTERIA_PORT=$(grep -o '"listen"[^,]*' "$CONFIG_FILE" | cut -d: -f3 | tr -d '"' | tr -d ' ' | tr -d '}')
+    fi
+    
+    if [[ -n "$HYSTERIA_PORT" && "$HYSTERIA_PORT" != "null" && "$HYSTERIA_PORT" =~ ^[0-9]+$ ]]; then
+        log_success "Hysteria port: $HYSTERIA_PORT"
+        
+        if command -v netstat >/dev/null 2>&1; then
+            echo "Active UDP connections on port $HYSTERIA_PORT:"
+            connection_count=$(netstat -un | grep ":$HYSTERIA_PORT " | wc -l)
+            echo "Connection count: $connection_count"
+            
+            if [[ "$connection_count" -gt 0 ]]; then
+                echo "Connection details (first 5):"
+                netstat -un | grep ":$HYSTERIA_PORT " | head -5
+            fi
+            
+            # Check if port is listening
+            echo -e "\nListening status:"
+            netstat -ln | grep ":$HYSTERIA_PORT " || log_warning "Port $HYSTERIA_PORT not listening"
+        fi
+        
+        if command -v ss >/dev/null 2>&1; then
+            echo -e "\nUsing ss command:"
+            ss -un | grep ":$HYSTERIA_PORT" | wc -l | xargs echo "UDP connections:"
+        fi
+        
+    else
+        log_error "Could not determine Hysteria port from config"
+        echo "Config file content preview:"
+        head -20 "$CONFIG_FILE"
+    fi
+    
+else
+    log_error "Config file not found: $CONFIG_FILE"
+    if [[ -d "$CONFIG_DIR" ]]; then
+        log_info "Config directory contents:"
+        ls -la "$CONFIG_DIR"
+    else
+        log_error "Config directory does not exist: $CONFIG_DIR"
+    fi
+fi
+
+# 7. Enhanced manual test
+echo -e "\n7. Manual test - database operations..."
+if [[ -f "$USER_DB" ]]; then
+    # Test database connectivity
+    if sqlite3 "$USER_DB" "SELECT 1;" >/dev/null 2>&1; then
+        log_success "Database is accessible"
+        
+        # Test insert capability
+        test_username="debug_test_$(date +%s)"
+        if sqlite3 "$USER_DB" "INSERT OR IGNORE INTO online_sessions (username, ip_address, connect_time, status) VALUES ('$test_username', '192.168.1.100', datetime('now'), 'online');" 2>/dev/null; then
+            log_success "Database insert test successful"
+            
+            # Count after insert
+            count_after=$(sqlite3 "$USER_DB" "SELECT COUNT(*) FROM online_sessions WHERE status='online';" 2>/dev/null || echo "0")
+            echo "Online count after test insert: $count_after"
+            
+            # Test web status file update
+            if echo "$count_after" > "$WEB_STATUS_FILE" 2>/dev/null; then
+                log_success "Web status file update successful"
+                chmod 644 "$WEB_STATUS_FILE" 2>/dev/null
+                
+                # Verify content
+                actual_content=$(cat "$WEB_STATUS_FILE" 2>/dev/null || echo "error")
+                echo "Web status file content: '$actual_content'"
+                
+                if [[ "$actual_content" == "$count_after" ]]; then
+                    log_success "Web status file content matches database count"
+                else
+                    log_error "Web status file content mismatch"
+                fi
+            else
+                log_error "Failed to update web status file"
+            fi
+            
+            # Clean up test data
+            sleep 1
+            sqlite3 "$USER_DB" "DELETE FROM online_sessions WHERE username='$test_username';" 2>/dev/null
+            log_info "Test data cleaned up"
+            
+        else
+            log_error "Database insert test failed"
+        fi
+        
+    else
+        log_error "Database is not accessible or corrupted"
+    fi
+else
+    log_error "Cannot perform manual test - database not found"
+fi
+
+# 8. Additional system checks
+echo -e "\n8. Additional system checks..."
+
+# Check disk space
+echo "Disk space for critical directories:"
+df -h /etc /var/log /var/www 2>/dev/null | grep -E "(Filesystem|/etc|/var/log|/var/www)" || log_warning "Could not check disk space"
+
+# Check system load
+echo -e "\nSystem load:"
+uptime
+
+# Check for any hysteria processes
+echo -e "\nHysteria processes:"
+ps aux | grep -i hysteria | grep -v grep || log_info "No Hysteria processes found"
+
+# Check recent system logs for hysteria
+echo -e "\nRecent system logs mentioning hysteria:"
+grep -i hysteria /var/log/syslog 2>/dev/null | tail -3 || log_info "No recent system logs found"
+
+echo -e "\n=== DEBUGGING COMPLETE ==="
+echo
+echo -e "${BLUE}=== SUMMARY RECOMMENDATIONS ===${NC}"
+
+# Generate recommendations based on findings
+if [[ ! -f "$USER_DB" ]]; then
+    echo "🔧 DATABASE: Create the database and tables (run main script option 13)"
+fi
+
+if [[ ! -f "$LOG_FILE" ]]; then
+    echo "🔧 LOGGING: Configure Hysteria logging in config file"
+fi
+
+if ! systemctl is-active udp-web-status >/dev/null 2>&1; then
+    echo "🔧 MONITORING: Start the monitoring service (main script option 15)"
+fi
+
+if ! systemctl list-units --type=service | grep -q hysteria || ! systemctl is-active hysteria-server >/dev/null 2>&1; then
+    echo "🔧 SERVICE: Start Hysteria server service"
+fi
+
+if [[ ! -f "$WEB_STATUS_FILE" ]]; then
+    echo "🔧 WEB STATUS: Create web status file and directory structure"
+fi
+
+echo
+echo "🌐 TEST WEB ENDPOINT: curl http://localhost:81/udpserver/online"
+echo "📊 MONITOR LOGS: tail -f $LOG_FILE"
+echo "🔍 CHECK SERVICE: systemctl status hysteria-server"
+echo "💾 QUERY DATABASE: sqlite3 $USER_DB 'SELECT * FROM online_sessions;'"
+echo
+echo "For more help, run the main management script and use the built-in options."
+}
+
 # Show user connection history
 show_user_history() {
     echo -e "\n\e[1;34mEnter username to view history:\e[0m"
