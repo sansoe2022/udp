@@ -165,34 +165,89 @@ track_connections() {
         return
     fi
     
-    # Monitor new connections
+    # Monitor new connections with better pattern matching
     tail -f "$LOG_FILE" | while read line; do
-        # Look for connection patterns in Hysteria logs
-        if echo "$line" | grep -q "client connected"; then
-            local timestamp=$(echo "$line" | awk '{print $1 " " $2}')
-            local ip=$(echo "$line" | grep -o '[0-9]\{1,3\}\.[0-9]\{1,3\}\.[0-9]\{1,3\}\.[0-9]\{1,3\}')
-            local username=$(echo "$line" | grep -o 'user=[^ ]*' | cut -d= -f2)
+        # Multiple patterns for different Hysteria log formats
+        if echo "$line" | grep -qE "(client.*connect|connection.*establish|auth.*success|user.*login)"; then
+            local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+            local ip=$(echo "$line" | grep -oE '[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}' | head -1)
+            local username=$(echo "$line" | grep -oE '(user[=:][^[:space:]]+|auth[=:][^[:space:]]+)' | cut -d= -f2 | cut -d: -f2)
             
-            if [[ -n "$username" && -n "$ip" ]]; then
-                sqlite3 "$USER_DB" "INSERT INTO online_sessions (username, ip_address, connect_time, status) VALUES ('$username', '$ip', '$timestamp', 'online');"
+            # Fallback: extract from different log formats
+            if [[ -z "$username" ]]; then
+                username=$(echo "$line" | grep -oE '"[^"]*"' | tr -d '"' | head -1)
+            fi
+            
+            # If still no username, use IP as identifier
+            if [[ -z "$username" && -n "$ip" ]]; then
+                username="user_$ip"
+            fi
+            
+            if [[ -n "$ip" ]]; then
+                # Prevent duplicate entries
+                sqlite3 "$USER_DB" "INSERT OR IGNORE INTO online_sessions (username, ip_address, connect_time, status) VALUES ('$username', '$ip', '$timestamp', 'online');"
                 echo "$timestamp - $username ($ip) connected" >> "$ONLINE_USERS_FILE"
                 update_web_status
+                echo "DEBUG: Connection detected - User: $username, IP: $ip"
             fi
-        elif echo "$line" | grep -q "client disconnected"; then
-            local timestamp=$(echo "$line" | awk '{print $1 " " $2}')
-            local ip=$(echo "$line" | grep -o '[0-9]\{1,3\}\.[0-9]\{1,3\}\.[0-9]\{1,3\}\.[0-9]\{1,3\}')
-            local username=$(echo "$line" | grep -o 'user=[^ ]*' | cut -d= -f2)
             
-            if [[ -n "$username" && -n "$ip" ]]; then
+        elif echo "$line" | grep -qE "(client.*disconnect|connection.*close|user.*logout|connection.*end)"; then
+            local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+            local ip=$(echo "$line" | grep -oE '[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}' | head -1)
+            local username=$(echo "$line" | grep -oE '(user[=:][^[:space:]]+|auth[=:][^[:space:]]+)' | cut -d= -f2 | cut -d: -f2)
+            
+            if [[ -z "$username" ]]; then
+                username=$(echo "$line" | grep -oE '"[^"]*"' | tr -d '"' | head -1)
+            fi
+            
+            if [[ -z "$username" && -n "$ip" ]]; then
+                username="user_$ip"
+            fi
+            
+            if [[ -n "$ip" ]]; then
                 sqlite3 "$USER_DB" "UPDATE online_sessions SET disconnect_time='$timestamp', status='offline' WHERE username='$username' AND ip_address='$ip' AND status='online';"
                 echo "$timestamp - $username ($ip) disconnected" >> "$ONLINE_USERS_FILE"
                 update_web_status
+                echo "DEBUG: Disconnection detected - User: $username, IP: $ip"
             fi
         fi
     done &
 }
 
-# Show currently online users
+# Alternative method: Track connections via netstat
+track_netstat_connections() {
+    echo -e "\e[1;34mStarting netstat-based connection tracking...\e[0m"
+    
+    local hysteria_port=$(jq -r '.listen' "$CONFIG_FILE" | cut -d: -f2)
+    if [[ -z "$hysteria_port" || "$hysteria_port" == "null" ]]; then
+        echo -e "\e[1;31mCannot determine Hysteria port from config\e[0m"
+        return
+    fi
+    
+    # Background process to monitor connections
+    (
+        while true; do
+            if [[ -f "$WEB_STATUS_ENABLED" ]]; then
+                # Count active UDP connections on Hysteria port
+                local active_count=$(netstat -un | grep ":$hysteria_port " | wc -l)
+                
+                # Alternative: use ss command if available
+                if command -v ss >/dev/null 2>&1; then
+                    active_count=$(ss -u -n | grep ":$hysteria_port " | wc -l)
+                fi
+                
+                # Update web status with active connection count
+                echo "$active_count" > "$WEB_STATUS_FILE"
+                chmod 644 "$WEB_STATUS_FILE" 2>/dev/null
+                
+                echo "$(date): Active connections: $active_count" >> "$ONLINE_USERS_FILE"
+            fi
+            sleep 10
+        done
+    ) &
+    
+    echo -e "\e[1;32mNetstat monitoring started (updates every 10 seconds)\e[0m"
+}
 show_online_users() {
     echo -e "\n\e[1;34m=== Currently Online Users ===\e[0m"
     
@@ -276,18 +331,31 @@ cleanup_sessions() {
 start_monitoring() {
     # Kill existing monitoring process if any
     pkill -f "tail -f $LOG_FILE"
+    pkill -f "netstat.*$CONFIG_DIR"
     
     echo -e "\e[1;34mStarting connection monitoring...\e[0m"
     enable_logging
     restart_server
     sleep 3
-    track_connections
-    echo -e "\e[1;32mConnection monitoring started in background.\e[0m"
+    
+    # Try log-based tracking first
+    if [[ -f "$LOG_FILE" && -s "$LOG_FILE" ]]; then
+        echo -e "\e[1;32mStarting log-based monitoring...\e[0m"
+        track_connections
+    else
+        echo -e "\e[1;33mLog file empty or not found. Using netstat-based monitoring...\e[0m"
+        track_netstat_connections
+    fi
+    
+    echo -e "\e[1;32mConnection monitoring started.\e[0m"
+    echo -e "\e[1;36mTo test: Connect a client and check option 10 (Show online users)\e[0m"
 }
 
 # Stop connection monitoring
 stop_monitoring() {
     pkill -f "tail -f $LOG_FILE"
+    pkill -f "netstat.*$CONFIG_DIR"
+    pkill -f "ss.*$CONFIG_DIR"
     echo -e "\e[1;32mConnection monitoring stopped.\e[0m"
 }
 
@@ -420,9 +488,10 @@ show_menu() {
     echo "15. Enable web status link"
     echo "16. Disable web status link"
     echo "17. Check web status"
-    echo "18. Cleanup old sessions"
-    echo "19. Uninstall server"
-    echo -e "20. Exit\e[0m"
+    echo "18. Debug connection tracking"
+    echo "19. Cleanup old sessions"
+    echo "20. Uninstall server"
+    echo -e "21. Exit\e[0m"
     echo -e "\e[1;36m----------------------------"
     echo -e "Enter your choice: \e[0m"
 }
@@ -452,9 +521,10 @@ while true; do
         15) enable_web_status ;;
         16) disable_web_status ;;
         17) check_web_status ;;
-        18) cleanup_sessions ;;
-        19) uninstall_server; exit 0 ;;
-        20) exit 0 ;;
+        18) debug_connection_tracking ;;
+        19) cleanup_sessions ;;
+        20) uninstall_server; exit 0 ;;
+        21) exit 0 ;;
         *) echo -e "\e[1;31mInvalid choice. Please try again.\e[0m" ;;
     esac
 done
