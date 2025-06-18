@@ -1064,8 +1064,8 @@ show_menu() {
     echo "18. Debug connection tracking"
     echo "19. Cleanup old sessions"
     echo "20. Uninstall server"
-    echo -e "21. Exit\e[0m"
-    echo "22. Check/Fix configuration"
+    echo "21. Check/Fix configuration"
+    echo -e "22. Exit\e[0m"
     echo -e "\e[1;36m----------------------------"
     echo -e "Enter your choice: \e[0m"
 }
@@ -1098,8 +1098,8 @@ while true; do
         18) debug_connection_tracking ;;
         19) cleanup_sessions ;;
         20) uninstall_server; exit 0 ;;
-        21) exit 0 ;;
-        22) check_hysteria_config ;;
+        21) check_hysteria_config ;;
+        22) clear; exit 0 ;;
         *) echo -e "\e[1;31mInvalid choice. Please try again.\e[0m" ;;
     esac
 done
