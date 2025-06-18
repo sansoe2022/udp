@@ -31,11 +31,14 @@ init_database() {
     );"
 }
 
+
 fetch_users() {
     if [[ -f "$USER_DB" ]]; then
         sqlite3 "$USER_DB" "SELECT username || ':' || password FROM users;" | paste -sd, -
     fi
 }
+
+
 
 update_userpass_config() {
     local users=$(fetch_users)
@@ -327,29 +330,173 @@ cleanup_sessions() {
     echo -e "\e[1;32mCleaned up $cleaned old offline sessions (older than 7 days).\e[0m"
 }
 
-# Start connection monitoring daemon
-start_monitoring() {
-    # Kill existing monitoring process if any
-    pkill -f "tail -f $LOG_FILE"
-    pkill -f "netstat.*$CONFIG_DIR"
+
+# Add this function to your script (insert it before the show_banner function)
+
+check_web_status() {
+    echo -e "\n\e[1;34m=== Web Status Check ===\e[0m"
     
+    if [[ -f "$WEB_STATUS_ENABLED" ]]; then
+        echo -e "\e[1;32m✓ Web status is enabled\e[0m"
+        
+        # Check if service is running
+        if systemctl is-active udp-web-status >/dev/null 2>&1; then
+            echo -e "\e[1;32m✓ Web status service is running\e[0m"
+        else
+            echo -e "\e[1;31m❌ Web status service is not running\e[0m"
+            echo -e "\e[1;33mTrying to start service...\e[0m"
+            systemctl start udp-web-status
+        fi
+        
+        # Check if nginx is running
+        if systemctl is-active nginx >/dev/null 2>&1; then
+            echo -e "\e[1;32m✓ Nginx is running\e[0m"
+        else
+            echo -e "\e[1;31m❌ Nginx is not running\e[0m"
+            echo -e "\e[1;33mTrying to start nginx...\e[0m"
+            systemctl start nginx
+        fi
+        
+        # Check web status file
+        if [[ -f "$WEB_STATUS_FILE" ]]; then
+            local current_count=$(cat "$WEB_STATUS_FILE" 2>/dev/null || echo "error")
+            echo -e "\e[1;32m✓ Web status file exists\e[0m"
+            echo -e "\e[1;36mCurrent online count: $current_count\e[0m"
+        else
+            echo -e "\e[1;31m❌ Web status file not found\e[0m"
+            echo -e "\e[1;33mCreating web status file...\e[0m"
+            update_web_status
+        fi
+        
+        # Test the endpoint
+        local server_ip=$(curl -s ifconfig.me 2>/dev/null || hostname -I | awk '{print $1}')
+        echo -e "\n\e[1;34mTesting endpoint:\e[0m"
+        echo -e "\e[1;36mURL: http://$server_ip:81/udpserver/online\e[0m"
+        
+        # Test locally
+        local test_result=$(curl -s http://localhost:81/udpserver/online 2>/dev/null || echo "connection_failed")
+        if [[ "$test_result" =~ ^[0-9]+$ ]]; then
+            echo -e "\e[1;32m✓ Local test successful: $test_result\e[0m"
+        else
+            echo -e "\e[1;31m❌ Local test failed: $test_result\e[0m"
+        fi
+        
+    else
+        echo -e "\e[1;31m❌ Web status is disabled\e[0m"
+        echo -e "\e[1;33mUse option 15 to enable web status\e[0m"
+    fi
+}
+
+# Fix the enable_logging function to ensure log directory and file exist
+enable_logging() {
+    # Ensure log directory exists
+    mkdir -p "$(dirname "$LOG_FILE")"
+    
+    # Create log file if it doesn't exist
+    touch "$LOG_FILE"
+    
+    # Set proper permissions
+    chmod 644 "$LOG_FILE"
+    
+    # Update config with logging
+    if [[ -f "$CONFIG_FILE" ]]; then
+        jq '.log.level = "info" | .log.file = "/var/log/hysteria/hysteria.log"' "$CONFIG_FILE" > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" "$CONFIG_FILE"
+        echo -e "\e[1;32mLogging enabled in configuration\e[0m"
+    else
+        echo -e "\e[1;31mConfig file not found: $CONFIG_FILE\e[0m"
+    fi
+}
+
+# Enhanced start_monitoring function with better log file handling
+start_monitoring() {
     echo -e "\e[1;34mStarting connection monitoring...\e[0m"
+    
+    # Kill existing monitoring process if any
+    pkill -f "tail -f $LOG_FILE" 2>/dev/null
+    
+    # Enable logging first
     enable_logging
+    
+    # Restart server to apply logging config
+    echo -e "\e[1;33mRestarting server to apply logging configuration...\e[0m"
     restart_server
+    
+    # Wait for server to start
     sleep 3
     
-    # Try log-based tracking first
-    if [[ -f "$LOG_FILE" && -s "$LOG_FILE" ]]; then
-        echo -e "\e[1;32mStarting log-based monitoring...\e[0m"
+    # Check if log file was created
+    if [[ -f "$LOG_FILE" ]]; then
+        echo -e "\e[1;32m✓ Log file exists: $LOG_FILE\e[0m"
+        
+        # Start tracking connections
         track_connections
+        echo -e "\e[1;32mConnection monitoring started in background.\e[0m"
+        echo -e "\e[1;36mYou can monitor logs with: tail -f $LOG_FILE\e[0m"
     else
-        echo -e "\e[1;33mLog file empty or not found. Using netstat-based monitoring...\e[0m"
-        track_netstat_connections
+        echo -e "\e[1;31m❌ Log file still not found after restart\e[0m"
+        echo -e "\e[1;33mTrying to create log file manually...\e[0m"
+        
+        # Create log file manually
+        touch "$LOG_FILE"
+        chmod 644 "$LOG_FILE"
+        
+        if [[ -f "$LOG_FILE" ]]; then
+            echo -e "\e[1;32m✓ Log file created manually\e[0m"
+            track_connections
+            echo -e "\e[1;32mConnection monitoring started.\e[0m"
+        else
+            echo -e "\e[1;31m❌ Failed to create log file. Check permissions.\e[0m"
+        fi
     fi
-    
-    echo -e "\e[1;32mConnection monitoring started.\e[0m"
-    echo -e "\e[1;36mTo test: Connect a client and check option 10 (Show online users)\e[0m"
 }
+
+# Add this function to check and fix hysteria configuration
+check_hysteria_config() {
+    echo -e "\n\e[1;34m=== Checking Hysteria Configuration ===\e[0m"
+    
+    if [[ -f "$CONFIG_FILE" ]]; then
+        echo -e "\e[1;32m✓ Config file exists\e[0m"
+        
+        # Check if log section exists
+        local has_log_section=$(jq -r '.log' "$CONFIG_FILE" 2>/dev/null)
+        if [[ "$has_log_section" == "null" ]]; then
+            echo -e "\e[1;33m⚠ Log section missing from config\e[0m"
+            echo -e "\e[1;33mAdding log configuration...\e[0m"
+            
+            # Add log section
+            jq '. + {"log": {"level": "info", "file": "/var/log/hysteria/hysteria.log"}}' "$CONFIG_FILE" > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" "$CONFIG_FILE"
+            echo -e "\e[1;32m✓ Log configuration added\e[0m"
+        else
+            echo -e "\e[1;32m✓ Log section exists in config\e[0m"
+        fi
+        
+        # Verify log file path in config
+        local log_file_in_config=$(jq -r '.log.file' "$CONFIG_FILE" 2>/dev/null)
+        if [[ "$log_file_in_config" == "/var/log/hysteria/hysteria.log" ]]; then
+            echo -e "\e[1;32m✓ Log file path is correct in config\e[0m"
+        else
+            echo -e "\e[1;33m⚠ Log file path incorrect in config: $log_file_in_config\e[0m"
+            echo -e "\e[1;33mFixing log file path...\e[0m"
+            jq '.log.file = "/var/log/hysteria/hysteria.log"' "$CONFIG_FILE" > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" "$CONFIG_FILE"
+            echo -e "\e[1;32m✓ Log file path fixed\e[0m"
+        fi
+        
+    else
+        echo -e "\e[1;31m❌ Config file not found: $CONFIG_FILE\e[0m"
+        echo -e "\e[1;33mPlease ensure Hysteria is properly installed\e[0m"
+    fi
+}
+
+# Add this to your menu - insert option 21 before option 20 (Exit)
+# In the show_menu function, add:
+# echo "21. Check/Fix configuration"
+
+# And in the case statement, add:
+# 21) check_hysteria_config ;;
+
+# Also update the exit option numbers from 20 to 21
+
+
 
 # Stop connection monitoring
 stop_monitoring() {
@@ -492,6 +639,7 @@ show_menu() {
     echo "19. Cleanup old sessions"
     echo "20. Uninstall server"
     echo -e "21. Exit\e[0m"
+    echo "22. Check/Fix configuration"
     echo -e "\e[1;36m----------------------------"
     echo -e "Enter your choice: \e[0m"
 }
@@ -525,6 +673,7 @@ while true; do
         19) cleanup_sessions ;;
         20) uninstall_server; exit 0 ;;
         21) exit 0 ;;
+        22) check_hysteria_config ;;
         *) echo -e "\e[1;31mInvalid choice. Please try again.\e[0m" ;;
     esac
 done
