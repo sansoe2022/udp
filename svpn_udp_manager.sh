@@ -163,55 +163,28 @@ enable_logging() {
 
 # Parse logs to track connections
 track_connections() {
-    if [[ ! -f "$LOG_FILE" ]]; then
-        echo -e "\e[1;33mLog file not found. Make sure logging is enabled.\e[0m"
-        return
-    fi
-    
-    # Monitor new connections with better pattern matching
-    tail -f "$LOG_FILE" | while read line; do
-        # Multiple patterns for different Hysteria log formats
-        if echo "$line" | grep -qE "(client.*connect|connection.*establish|auth.*success|user.*login)"; then
+    # Monitor new connections from journald log
+    journalctl -u hysteria-server -f --no-pager | while read line; do
+        # check for connection events
+        if echo "$line" | grep -qE "Client connected"; then
+            # Extract src IP
             local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
-            local ip=$(echo "$line" | grep -oE '[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}' | head -1)
-            local username=$(echo "$line" | grep -oE '(user[=:][^[:space:]]+|auth[=:][^[:space:]]+)' | cut -d= -f2 | cut -d: -f2)
-            
-            # Fallback: extract from different log formats
-            if [[ -z "$username" ]]; then
-                username=$(echo "$line" | grep -oE '"[^"]*"' | tr -d '"' | head -1)
-            fi
-            
-            # If still no username, use IP as identifier
-            if [[ -z "$username" && -n "$ip" ]]; then
-                username="user_$ip"
-            fi
-            
+            local ip=$(echo "$line" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+            # Username not present in v1 logs, so use IP as username or custom logic
+            local username="user_$ip"
             if [[ -n "$ip" ]]; then
-                # Prevent duplicate entries
                 sqlite3 "$USER_DB" "INSERT OR IGNORE INTO online_sessions (username, ip_address, connect_time, status) VALUES ('$username', '$ip', '$timestamp', 'online');"
                 echo "$timestamp - $username ($ip) connected" >> "$ONLINE_USERS_FILE"
                 update_web_status
-                echo "DEBUG: Connection detected - User: $username, IP: $ip"
             fi
-            
-        elif echo "$line" | grep -qE "(client.*disconnect|connection.*close|user.*logout|connection.*end)"; then
+        elif echo "$line" | grep -qE "TCP EOF|Client disconnected"; then
             local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
-            local ip=$(echo "$line" | grep -oE '[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}' | head -1)
-            local username=$(echo "$line" | grep -oE '(user[=:][^[:space:]]+|auth[=:][^[:space:]]+)' | cut -d= -f2 | cut -d: -f2)
-            
-            if [[ -z "$username" ]]; then
-                username=$(echo "$line" | grep -oE '"[^"]*"' | tr -d '"' | head -1)
-            fi
-            
-            if [[ -z "$username" && -n "$ip" ]]; then
-                username="user_$ip"
-            fi
-            
+            local ip=$(echo "$line" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+            local username="user_$ip"
             if [[ -n "$ip" ]]; then
                 sqlite3 "$USER_DB" "UPDATE online_sessions SET disconnect_time='$timestamp', status='offline' WHERE username='$username' AND ip_address='$ip' AND status='online';"
                 echo "$timestamp - $username ($ip) disconnected" >> "$ONLINE_USERS_FILE"
                 update_web_status
-                echo "DEBUG: Disconnection detected - User: $username, IP: $ip"
             fi
         fi
     done &
