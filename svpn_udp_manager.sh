@@ -10,6 +10,7 @@ WEB_DIR="/var/www/html/udpserver"
 WEB_STATUS_FILE="$WEB_DIR/online"
 WEB_SERVICE_FILE="/etc/systemd/system/udp-web-status.service"
 WEB_STATUS_ENABLED="$CONFIG_DIR/web_status_enabled"
+TRACKER_PID_FILE="$CONFIG_DIR/.tracker_pid"
 
 mkdir -p "$CONFIG_DIR"
 mkdir -p "/var/log/hysteria"
