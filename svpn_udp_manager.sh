@@ -807,11 +807,11 @@ enable_logging() {
 }
 
 # Enhanced start_monitoring function with better log file handling
-# Enhanced start_monitoring function for journald log only (no log file)
 start_monitoring() {
     echo -e "\e[1;34mStarting connection monitoring (journald mode)...\e[0m"
-    pkill -f "journalctl -u hysteria-server -f --no-pager" 2>/dev/null
-    track_connections
+    stop_monitoring  # Always stop previous tracker
+    (track_connections) &
+    echo $! > "$TRACKER_PID_FILE"
     echo -e "\e[1;32mConnection monitoring started in background (systemd journal).\e[0m"
     echo -e "\e[1;36mYou can monitor logs with: journalctl -u hysteria-server -f --no-pager\e[0m"
 }
@@ -866,10 +866,17 @@ check_hysteria_config() {
 
 # Stop connection monitoring
 stop_monitoring() {
-    pkill -f "tail -f $LOG_FILE"
+    if [[ -f "$TRACKER_PID_FILE" ]]; then
+        local pid=$(cat "$TRACKER_PID_FILE")
+        if ps -p "$pid" > /dev/null 2>&1; then
+            kill "$pid"
+            echo -e "\e[1;32mStopped previous monitoring process (PID $pid).\e[0m"
+        fi
+        rm -f "$TRACKER_PID_FILE"
+    fi
+    pkill -f "journalctl -u hysteria-server -f --no-pager" 2>/dev/null
     pkill -f "netstat.*$CONFIG_DIR"
     pkill -f "ss.*$CONFIG_DIR"
-    echo -e "\e[1;32mConnection monitoring stopped.\e[0m"
 }
 
 add_user() {
