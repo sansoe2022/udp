@@ -164,15 +164,13 @@ enable_logging() {
 
 # Parse logs to track connections
 track_connections() {
-    # Monitor new connections from journald log
     journalctl -u hysteria-server -f --no-pager | while read line; do
-        # check for connection events
+        echo "DEBUG: $line"   # <-- Add this line
         if echo "$line" | grep -qE "Client connected"; then
-            # Extract src IP
             local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
             local ip=$(echo "$line" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | head -1)
-            # Username not present in v1 logs, so use IP as username or custom logic
             local username="user_$ip"
+            echo "DEBUG: CONNECT $username $ip $timestamp"
             if [[ -n "$ip" ]]; then
                 sqlite3 "$USER_DB" "INSERT OR IGNORE INTO online_sessions (username, ip_address, connect_time, status) VALUES ('$username', '$ip', '$timestamp', 'online');"
                 echo "$timestamp - $username ($ip) connected" >> "$ONLINE_USERS_FILE"
@@ -182,13 +180,14 @@ track_connections() {
             local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
             local ip=$(echo "$line" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | head -1)
             local username="user_$ip"
+            echo "DEBUG: DISCONNECT $username $ip $timestamp"
             if [[ -n "$ip" ]]; then
                 sqlite3 "$USER_DB" "UPDATE online_sessions SET disconnect_time='$timestamp', status='offline' WHERE username='$username' AND ip_address='$ip' AND status='online';"
                 echo "$timestamp - $username ($ip) disconnected" >> "$ONLINE_USERS_FILE"
                 update_web_status
             fi
         fi
-    done &
+    done
 }
 
 # Alternative method: Track connections via netstat
