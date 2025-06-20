@@ -807,46 +807,13 @@ enable_logging() {
 }
 
 # Enhanced start_monitoring function with better log file handling
+# Enhanced start_monitoring function for journald log only (no log file)
 start_monitoring() {
-    echo -e "\e[1;34mStarting connection monitoring...\e[0m"
-    
-    # Kill existing monitoring process if any
-    pkill -f "tail -f $LOG_FILE" 2>/dev/null
-    
-    # Enable logging first
-    enable_logging
-    
-    # Restart server to apply logging config
-    echo -e "\e[1;33mRestarting server to apply logging configuration...\e[0m"
-    restart_server
-    
-    # Wait for server to start
-    sleep 3
-    
-    # Check if log file was created
-    if [[ -f "$LOG_FILE" ]]; then
-        echo -e "\e[1;32m✓ Log file exists: $LOG_FILE\e[0m"
-        
-        # Start tracking connections
-        track_connections
-        echo -e "\e[1;32mConnection monitoring started in background.\e[0m"
-        echo -e "\e[1;36mYou can monitor logs with: tail -f $LOG_FILE\e[0m"
-    else
-        echo -e "\e[1;31m❌ Log file still not found after restart\e[0m"
-        echo -e "\e[1;33mTrying to create log file manually...\e[0m"
-        
-        # Create log file manually
-        touch "$LOG_FILE"
-        chmod 644 "$LOG_FILE"
-        
-        if [[ -f "$LOG_FILE" ]]; then
-            echo -e "\e[1;32m✓ Log file created manually\e[0m"
-            track_connections
-            echo -e "\e[1;32mConnection monitoring started.\e[0m"
-        else
-            echo -e "\e[1;31m❌ Failed to create log file. Check permissions.\e[0m"
-        fi
-    fi
+    echo -e "\e[1;34mStarting connection monitoring (journald mode)...\e[0m"
+    pkill -f "journalctl -u hysteria-server -f --no-pager" 2>/dev/null
+    track_connections
+    echo -e "\e[1;32mConnection monitoring started in background (systemd journal).\e[0m"
+    echo -e "\e[1;36mYou can monitor logs with: journalctl -u hysteria-server -f --no-pager\e[0m"
 }
 
 # Add this function to check and fix hysteria configuration
