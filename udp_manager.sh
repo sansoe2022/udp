@@ -967,7 +967,7 @@ restart_server() {
 }
 
 uninstall_server() {
-    echo -e "\n\e[1;34mUninstalling AGN-UDP server...\e[0m"
+    echo -e "\n\e[1;34mUninstalling UDP server...\e[0m"
     stop_monitoring
     disable_web_status
     systemctl stop hysteria-server
@@ -976,20 +976,20 @@ uninstall_server() {
     systemctl daemon-reload
     rm -rf "$CONFIG_DIR"
     rm -f /usr/local/bin/hysteria
-    echo -e "\e[1;32mAGN-UDP server uninstalled successfully.\e[0m"
+    echo -e "\e[1;32mUDP server uninstalled successfully.\e[0m"
 }
 
 show_banner() {
     echo -e "\e[1;36m---------------------------------------------"
-    echo " SVPN UDP Manager with Online User Tracking"
-    echo " (c) 2025 SVPN"
+    echo " UDP Manager with Online User Tracking"
+    echo " (c) 2025 UDP"
     echo " Telegram: @sansoe2021"
     echo "---------------------------------------------\e[0m"
 }
 
 show_menu() {
     echo -e "\e[1;36m----------------------------"
-    echo " SVPN UDP Manager"
+    echo " UDP Manager"
     echo -e "----------------------------\e[0m"
     echo -e "\e[1;32m1. Add new user"
     echo "2. Edit user password"
