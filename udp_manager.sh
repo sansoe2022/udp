@@ -30,6 +30,14 @@ init_database() {
         status TEXT DEFAULT 'online',
         FOREIGN KEY(username) REFERENCES users(username)
     );"
+
+    # Add index for better query performance
+    sqlite3 "$USER_DB" "CREATE INDEX IF NOT EXISTS idx_online_sessions_status ON online_sessions(status);"
+    sqlite3 "$USER_DB" "CREATE INDEX IF NOT EXISTS idx_online_sessions_user_ip ON online_sessions(username, ip_address, status);"
+
+    # Cleanup: Mark any stale 'online' sessions as offline on startup
+    # (sessions that were left online due to improper shutdown)
+    sqlite3 "$USER_DB" "UPDATE online_sessions SET status='offline', disconnect_time=datetime('now') WHERE status='online' AND disconnect_time IS NULL AND datetime(connect_time) < datetime('now', '-1 hour');"
 }
 
 
@@ -164,25 +172,35 @@ enable_logging() {
 
 # Parse logs to track connections
 track_connections() {
-    journalctl -u hysteria-server -f --no-pager | while read line; do
-        echo "DEBUG: $line"   # <-- Add this line
-        if echo "$line" | grep -qE "Client connected"; then
-            local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+    journalctl -u hysteria-server -f --no-pager | while read -r line; do
+        # Look for connection patterns - expanded to catch more log formats
+        if echo "$line" | grep -qiE "connect|accepted|new.*client|client.*established|session.*start"; then
             local ip=$(echo "$line" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | head -1)
-            local username="user_$ip"
-            echo "DEBUG: CONNECT $username $ip $timestamp"
-            if [[ -n "$ip" ]]; then
-                sqlite3 "$USER_DB" "INSERT OR IGNORE INTO online_sessions (username, ip_address, connect_time, status) VALUES ('$username', '$ip', '$timestamp', 'online');"
+
+            if [[ -n "$ip" && "$ip" != "127.0.0.1" && "$ip" != "0.0.0.0" ]]; then
+                local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+                local username="user_$ip"
+
+                # First, mark any existing online sessions for this user/IP as offline
+                sqlite3 "$USER_DB" "UPDATE online_sessions SET disconnect_time='$timestamp', status='offline' WHERE username='$username' AND ip_address='$ip' AND status='online';"
+
+                # Now insert the new connection
+                sqlite3 "$USER_DB" "INSERT INTO online_sessions (username, ip_address, connect_time, status) VALUES ('$username', '$ip', '$timestamp', 'online');"
+
                 echo "$timestamp - $username ($ip) connected" >> "$ONLINE_USERS_FILE"
                 update_web_status
             fi
-        elif echo "$line" | grep -qE "TCP EOF|Client disconnected"; then
-            local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+
+        # Look for disconnection patterns - expanded to catch more log formats
+        elif echo "$line" | grep -qiE "disconnect|close|EOF|session.*end|session.*term|connection.*closed"; then
             local ip=$(echo "$line" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | head -1)
-            local username="user_$ip"
-            echo "DEBUG: DISCONNECT $username $ip $timestamp"
-            if [[ -n "$ip" ]]; then
+
+            if [[ -n "$ip" && "$ip" != "127.0.0.1" && "$ip" != "0.0.0.0" ]]; then
+                local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+                local username="user_$ip"
+
                 sqlite3 "$USER_DB" "UPDATE online_sessions SET disconnect_time='$timestamp', status='offline' WHERE username='$username' AND ip_address='$ip' AND status='online';"
+
                 echo "$timestamp - $username ($ip) disconnected" >> "$ONLINE_USERS_FILE"
                 update_web_status
             fi
@@ -725,6 +743,14 @@ kick_user() {
 
 # Clear offline users from database
 cleanup_sessions() {
+    # First, mark any stale 'online' sessions as offline
+    local stale_count=$(sqlite3 "$USER_DB" "UPDATE online_sessions SET status='offline', disconnect_time=datetime('now') WHERE status='online' AND disconnect_time IS NULL AND datetime(connect_time) < datetime('now', '-1 hour'); SELECT changes();")
+    if [[ "$stale_count" -gt 0 ]]; then
+        echo -e "\e[1;33mMarked $stale_count stale online session(s) as offline\e[0m"
+        update_web_status
+    fi
+
+    # Then delete old offline sessions
     local cleaned=$(sqlite3 "$USER_DB" "DELETE FROM online_sessions WHERE status='offline' AND datetime(disconnect_time) < datetime('now', '-7 days'); SELECT changes();")
     echo -e "\e[1;32mCleaned up $cleaned old offline sessions (older than 7 days).\e[0m"
 }
@@ -809,6 +835,15 @@ enable_logging() {
 # Enhanced start_monitoring function with better log file handling
 start_monitoring() {
     echo -e "\e[1;34mStarting connection monitoring (journald mode)...\e[0m"
+
+    # Clean up any stale online sessions before starting
+    echo -e "\e[1;33mCleaning up stale sessions...\e[0m"
+    local stale_count=$(sqlite3 "$USER_DB" "UPDATE online_sessions SET status='offline', disconnect_time=datetime('now') WHERE status='online' AND disconnect_time IS NULL AND datetime(connect_time) < datetime('now', '-1 hour'); SELECT changes();")
+    if [[ "$stale_count" -gt 0 ]]; then
+        echo -e "\e[1;33mMarked $stale_count stale session(s) as offline\e[0m"
+        update_web_status
+    fi
+
     stop_monitoring  # Always stop previous tracker
     (track_connections) &
     echo $! > "$TRACKER_PID_FILE"
