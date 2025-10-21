@@ -448,18 +448,18 @@ check_environment() {
 
 show_usage_and_exit() {
     echo
-    echo -e "\t$(tbold)$SCRIPT_NAME$(treset) - SVPN-UDP server install script"
+    echo -e "\t$(tbold)$SCRIPT_NAME$(treset) - UDP server install script"
     echo
     echo -e "Usage:"
     echo
-    echo -e "$(tbold)Install SVPN-UDP$(treset)"
+    echo -e "$(tbold)Install UDP$(treset)"
     echo -e "\t$0 [ -f | -l <file> | --version <version> ]"
     echo -e "Flags:"
     echo -e "\t-f, --force\tForce re-install latest or specified version even if it has been installed."
-    echo -e "\t-l, --local <file>\tInstall specified SVPN-UDP binary instead of download it."
+    echo -e "\t-l, --local <file>\tInstall specified UDP binary instead of download it."
     echo -e "\t--version <version>\tInstall specified version instead of the latest."
     echo
-    echo -e "$(tbold)Remove SVPN-UDP$(treset)"
+    echo -e "$(tbold)Remove UDP$(treset)"
     echo -e "\t$0 --remove"
     echo
     echo -e "$(tbold)Check for the update$(treset)"
@@ -477,7 +477,7 @@ tpl_hysteria_server_service_base() {
 
     cat << EOF
 [Unit]
-Description=SVPN-UDP Service
+Description=UDP Service
 After=network.target
 
 [Service]
@@ -654,18 +654,18 @@ perform_install_hysteria_home_legacy() {
 }
 
 perform_install_manager_script() {
-    local _manager_script="/usr/local/bin/svpn_udp_manager.sh"
-    local _symlink_path="/usr/local/bin/svpnudp"
+    local _manager_script="/usr/local/bin/udp_manager.sh"
+    local _symlink_path="/usr/local/bin/udp"
     
     echo "Downloading manager script..."
-    curl -o "$_manager_script" "https://raw.githubusercontent.com/sansoe2022/udp/refs/heads/main/svpn_udp_manager.sh"
+    curl -o "$_manager_script" "https://raw.githubusercontent.com/sansoe2022/udp/refs/heads/main/udp_manager.sh"
     chmod +x "$_manager_script"
     
-    echo "Creating symbolic link to run the manager script using 'svpnudp' command..."
+    echo "Creating symbolic link to run the manager script using 'udp' command..."
     ln -sf "$_manager_script" "$_symlink_path"
     
     echo "Manager script installed at $_manager_script"
-    echo "You can now run the manager using the 'svpnudp' command."
+    echo "You can now run the manager using the 'udp' command."
 }
 
 is_hysteria_installed() {
@@ -732,13 +732,9 @@ perform_install() {
 
     if [[ -n "$_is_fresh_install" ]]; then
         echo
-        echo -e "$(tbold)Congratulations! SVPN-UDP has been successfully installed on your server.$(treset)"
-        echo "Use 'svpnudp' command to access the manager."
+        echo -e "$(tbold)Congratulations! UDP has been successfully installed on your server.$(treset)"
+        echo "Use 'udp' command to access the manager."
 
-        echo
-        echo -e "$(tbold)Client app SVPN Connect:$(treset)"
-        echo -e "$(tblue)https://play.google.com/store/apps/details?id=com.svpnmm.mmdev"
-        echo
         echo -e "Follow me!"
         echo
         echo -e "\t+ Follow me on Telegram: $(tblue)https://t.me/sansoe2021$(treset)"
@@ -748,7 +744,7 @@ perform_install() {
         restart_running_services
         start_services
         echo
-        echo -e "$(tbold)SVPN-UDP has been successfully updated to $VERSION.$(treset)"
+        echo -e "$(tbold)UDP has been successfully updated to $VERSION.$(treset)"
         echo
     fi
 }
@@ -759,7 +755,7 @@ perform_remove() {
     perform_remove_hysteria_systemd
 
     echo
-    echo -e "$(tbold)Congratulations! AGN-UDP has been successfully removed from your server.$(treset)"
+    echo -e "$(tbold)Congratulations! UDP has been successfully removed from your server.$(treset)"
     echo
     echo -e "You still need to remove configuration files and ACME certificates manually with the following commands:"
     echo
@@ -791,7 +787,7 @@ setup_ssl() {
 }
 
 start_services() {
-    echo "Starting SVPN-UDP"
+    echo "Starting UDP"
     apt update
     sudo debconf-set-selections <<< "iptables-persistent iptables-persistent/autosave_v4 boolean true"
     sudo debconf-set-selections <<< "iptables-persistent iptables-persistent/autosave_v6 boolean true"
