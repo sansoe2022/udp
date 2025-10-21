@@ -3,9 +3,10 @@ set -e
 
 # Prompt for Domain Name before installation
 prompt_for_domain() {
-    local default_domain="svpn.udp.com"
+IP2=$(wget -4qO- "http://whatismyip.akamai.com/")
+    local default_domain="$IP2"
     echo
-    echo -n "Enter your IP or DNS for this server (default: $default_domain): "
+    echo -n "Enter your IP or DNS for this server (default IP: $default_domain): "
     read -r input_domain
     if [[ -z "$input_domain" ]]; then
         DOMAIN="$default_domain"
@@ -512,9 +513,9 @@ tpl_etc_hysteria_config_json() {
   "cert": "/etc/hysteria/hysteria.server.crt",
   "key": "/etc/hysteria/hysteria.server.key",
   "up": "100 Mbps",
-  "up_mbps": 100,
+  "up_mbps": 10,
   "down": "100 Mbps",
-  "down_mbps": 100,
+  "down_mbps": 20,
   "disable_udp": false,
   "insecure": false,
   "obfs": "$OBFS",
