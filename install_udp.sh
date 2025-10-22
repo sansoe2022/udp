@@ -695,7 +695,7 @@ perform_install_hysteria_home_legacy() {
 
 # IMPROVED: Download manager script from your repository
 perform_install_manager_script() {
-    local _manager_script="/usr/local/bin/udp_manager.sh"
+    local _manager_script="https://raw.githubusercontent.com/sansoe2022/udp/refs/heads/main/udp_manager.sh"
     local _symlink_path="/usr/local/bin/udp"
     
     echo "Downloading manager script with online tracking..."
