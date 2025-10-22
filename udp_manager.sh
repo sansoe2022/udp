@@ -588,8 +588,8 @@ uninstall_server() {
 show_banner() {
     clear
     echo -e "${BLUE}═══════════════════════════════════════════${NC}"
-    echo -e "${CYAN}   UDP Manager with Smart Monitoring${NC}"
-    echo -e "${GREEN}   Auto-switching Background Loop - v2.1${NC}"
+    echo -e "${CYAN}   UDP Manager${NC}"
+    echo -e "${GREEN}   Supported Online Tracking - v2.1${NC}"
     echo -e "${YELLOW}   (c) 2025 - @sansoe2021${NC}"
     echo -e "${BLUE}═══════════════════════════════════════════${NC}"
 }
