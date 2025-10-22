@@ -207,7 +207,7 @@ track_connections() {
                 echo -e "${GREEN}[CONNECT]${NC} $username from $ip:${port:-unknown}"
             fi
             
-        elif echo "$line" | grep -qiE "client.*disconnect|connection.*clos|TCP EOF|session.*end|client.*left"; then
+        elif echo "$line" | grep -qiE "client.*disconnect|connection.*clos|session.*end|client.*left|timeout.*no recent network activity"; then
             local ip=$(echo "$line" | grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}' | head -1)
             
             if [[ -n "$ip" ]]; then
