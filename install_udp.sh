@@ -818,15 +818,15 @@ perform_install() {
         echo
         echo -e "$(tbold)Quick Start:$(treset)"
         echo -e "  1. Run: $(tblue)udp$(treset) to access the management menu"
-        echo -e "  2. Select option $(tyellow)13$(treset) to start connection monitoring"
-        echo -e "  3. Select option $(tyellow)15$(treset) to enable web status"
-        echo -e "  4. Select option $(tyellow)10$(treset) to view online users"
+        echo -e "  2. Select option $(tyellow)12$(treset) to online link"
+        echo -e "  3. Select option $(tyellow)13$(treset) to change domain"
+        echo -e "  4. Select option $(tyellow)5$(treset) to view online users"
         echo
         echo -e "$(tbold)Features:$(treset)"
         echo -e "  ✓ Multi-user online tracking"
         echo -e "  ✓ Real-time connection monitoring"
         echo -e "  ✓ Web-based status endpoint"
-        echo -e "  ✓ Connection history logging"
+        echo -e "  ✓ Custom change domain"
         echo
         echo -e "$(tbold)Follow me:$(treset)"
         echo -e "  Telegram: $(tblue)https://t.me/sansoe2021$(treset)"
