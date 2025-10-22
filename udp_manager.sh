@@ -608,7 +608,7 @@ show_menu() {
     echo -e "${YELLOW}9.  Stop online monitor${NC}"
     echo -e "${YELLOW}10. Start connection tracker (Recommended)${NC}"
     echo -e "${YELLOW}11. Stop connection tracker${NC}"
-    echo -e "${GREEN}12. Setup web server${NC}"
+    echo -e "${GREEN}12. Setup web online${NC}"
     echo -e "${GREEN}13. Change domain${NC}"
     echo -e "${GREEN}14. Change obfuscation${NC}"
     echo -e "${GREEN}15. Change upload speed${NC}"
