@@ -693,33 +693,55 @@ perform_install_hysteria_home_legacy() {
     fi
 }
 
-# IMPROVED: Download manager script from your repository
+# FIXED: Download manager script from your repository
 perform_install_manager_script() {
-    local _manager_script="https://raw.githubusercontent.com/sansoe2022/udp/refs/heads/main/udp_manager.sh"
+    local _manager_script="/usr/local/bin/udp_manager.sh"  # Local file path
+    local _manager_url="https://raw.githubusercontent.com/sansoe2022/udp/refs/heads/main/udp_manager.sh"  # Remote URL
     local _symlink_path="/usr/local/bin/udp"
     
     echo "Downloading manager script with online tracking..."
     
-    # Create temporary file for the improved manager script
-    cat > "$_manager_script" << 'MANAGER_SCRIPT_EOF'
+    # Try to download from GitHub first
+    if curl -o "$_manager_script" "$_manager_url" 2>/dev/null; then
+        echo "✓ Manager script downloaded successfully from GitHub"
+    else
+        echo "⚠ Warning: Could not download from GitHub, creating local version..."
+        
+        # If download fails, create a basic version
+        cat > "$_manager_script" << 'MANAGER_SCRIPT_EOF'
 #!/bin/bash
-# This is a placeholder - replace this with the actual improved udp_manager.sh content
-# Or download from your repository
-MANAGER_SCRIPT_EOF
 
-    # IMPORTANT: Replace the URL below with your actual repository URL
-    # Example: If you uploaded the improved script to GitHub
-    # curl -o "$_manager_script" "https://raw.githubusercontent.com/sansoe2022/udp/refs/heads/main/udp_manager.sh"
-    
-    # For now, let's create the improved script inline
-    # Copy the entire improved udp_manager.sh script here
-    # Or better yet, host it on GitHub and download it
+# Basic UDP Manager Script
+# This is a minimal version. For full features, manually download from:
+# https://raw.githubusercontent.com/sansoe2022/udp/refs/heads/main/udp_manager.sh
+
+CONFIG_DIR="/etc/hysteria"
+CONFIG_FILE="$CONFIG_DIR/config.json"
+USER_DB="$CONFIG_DIR/udpusers.db"
+
+echo "═══════════════════════════════════════"
+echo "   UDP Manager - Basic Version"
+echo "═══════════════════════════════════════"
+echo
+echo "For full features, download the complete script:"
+echo "curl -o /usr/local/bin/udp_manager.sh https://raw.githubusercontent.com/sansoe2022/udp/refs/heads/main/udp_manager.sh"
+echo
+echo "Database location: $USER_DB"
+echo "Config location: $CONFIG_FILE"
+echo
+echo "To view online users:"
+echo "sqlite3 $USER_DB 'SELECT COUNT(*) FROM online_sessions WHERE status=\"online\";'"
+echo
+echo "To start monitoring:"
+echo "journalctl -u hysteria-server -f"
+MANAGER_SCRIPT_EOF
+    fi
     
     # Make it executable
     chmod +x "$_manager_script"
     
     # Create symbolic link
-    echo "Creating symbolic link to run the manager script using 'udp' command..."
+    echo "Creating symbolic link..."
     ln -sf "$_manager_script" "$_symlink_path"
     
     echo "✓ Manager script installed at $_manager_script"
