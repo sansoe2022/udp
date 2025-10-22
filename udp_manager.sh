@@ -61,8 +61,8 @@ update_userpass_config() {
 
 # Background loop monitoring function (SSH style)
 fun_online() {
-    # Get Hysteria port from config
-    local HYSTERIA_PORT=$(jq -r '.listen' "$CONFIG_FILE" 2>/dev/null | cut -d: -f2)
+    # Get Hysteria port from config - FIXED parsing
+    local HYSTERIA_PORT=$(jq -r '.listen' "$CONFIG_FILE" 2>/dev/null | sed 's/^://' | cut -d: -f1)
     
     if [[ -z "$HYSTERIA_PORT" || "$HYSTERIA_PORT" == "null" ]]; then
         HYSTERIA_PORT="36712"  # Default port
@@ -73,7 +73,7 @@ fun_online() {
     
     # Method 1: Using ss command (faster and more reliable)
     if command -v ss >/dev/null 2>&1; then
-        _udp_count=$(ss -u -n | grep ":$HYSTERIA_PORT " | wc -l)
+        _udp_count=$(ss -un | grep ":$HYSTERIA_PORT " | wc -l)
     # Method 2: Using netstat as fallback
     elif command -v netstat >/dev/null 2>&1; then
         _udp_count=$(netstat -un | grep ":$HYSTERIA_PORT " | wc -l)
@@ -143,6 +143,12 @@ stop_online_monitor() {
 # Enhanced connection tracking (for detailed logging)
 track_connections() {
     echo -e "${BLUE}Starting detailed connection tracker...${NC}"
+    
+    # Get Hysteria port - FIXED
+    local HYSTERIA_PORT=$(jq -r '.listen' "$CONFIG_FILE" 2>/dev/null | sed 's/^://' | cut -d: -f1)
+    [[ -z "$HYSTERIA_PORT" ]] && HYSTERIA_PORT="36712"
+    
+    echo -e "${CYAN}Monitoring port: $HYSTERIA_PORT${NC}"
     
     # Clear stale connections on startup
     sqlite3 "$USER_DB" "UPDATE online_sessions SET status='offline', disconnect_time=datetime('now') WHERE status='online';"
