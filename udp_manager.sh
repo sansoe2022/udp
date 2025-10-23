@@ -45,6 +45,7 @@ init_database() {
     sqlite3 "$USER_DB" "CREATE INDEX IF NOT EXISTS idx_session_id ON online_sessions(session_id);"
     sqlite3 "$USER_DB" "CREATE INDEX IF NOT EXISTS idx_username ON online_sessions(username);"
     sqlite3 "$USER_DB" "CREATE INDEX IF NOT EXISTS idx_ip_address ON online_sessions(ip_address);"
+    sqlite3 "$USER_DB" "CREATE INDEX IF NOT EXISTS idx_port ON online_sessions(port);"
 }
 
 fetch_users() {
@@ -70,7 +71,7 @@ is_tracker_running() {
     return 1
 }
 
-# Background loop monitoring function - SMART VERSION
+# Background loop monitoring function - IMPROVED VERSION
 fun_online() {
     # Get Hysteria port from config
     local HYSTERIA_PORT=$(jq -r '.listen' "$CONFIG_FILE" 2>/dev/null | sed 's/^://' | cut -d: -f1)
@@ -81,29 +82,30 @@ fun_online() {
     
     local _onli=0
     
-    # Method 1: If tracker is running, use database (most accurate)
+    # Primary: If tracker is running, use database (most accurate)
     if is_tracker_running; then
         if [[ -f "$USER_DB" ]]; then
             _onli=$(sqlite3 "$USER_DB" "SELECT COUNT(DISTINCT session_id) FROM online_sessions WHERE status='online';" 2>/dev/null || echo "0")
         fi
     else
-        # Method 2: Fallback methods when tracker is not running
-        
-        # Try conntrack first (most accurate for UDP)
+        # Fallback: Use conntrack if available (counts active UDP associations)
         if command -v conntrack >/dev/null 2>&1; then
-            local _conntrack=$(conntrack -L 2>/dev/null | grep "dport=$HYSTERIA_PORT" | grep -v TIME_WAIT | wc -l)
+            local _conntrack=$(conntrack -L -p udp --dport "$HYSTERIA_PORT" 2>/dev/null | grep -c 'udp')
             _onli=$_conntrack
         fi
         
-        # If conntrack not available or returned 0, try log method
-        if [[ $_onli -eq 0 ]]; then
-            # Count recent connections from logs (last 2 minutes)
-            _onli=$(journalctl -u hysteria-server --since "2 minutes ago" --no-pager 2>/dev/null | grep -iE "client.*connect|accept|session.*start" | wc -l)
-        fi
-        
-        # Fallback to database even if tracker not running
+        # If conntrack not available or 0, fallback to database (even if tracker not running, might have some data)
         if [[ $_onli -eq 0 ]] && [[ -f "$USER_DB" ]]; then
             _onli=$(sqlite3 "$USER_DB" "SELECT COUNT(DISTINCT session_id) FROM online_sessions WHERE status='online';" 2>/dev/null || echo "0")
+        fi
+        
+        # Last resort: Approximate from recent logs (connects minus disconnects in last 5 min)
+        if [[ $_onli -eq 0 ]]; then
+            local recent_logs=$(journalctl -u hysteria-server --since "5 minutes ago" --no-pager 2>/dev/null)
+            local connects=$(echo "$recent_logs" | grep -icE "client.*connect|new.*connection|accept.*client|session.*start|authenticated|auth.*success")
+            local disconnects=$(echo "$recent_logs" | grep -icE "client.*disconnect|connection.*clos|session.*end|client.*left|timeout.*no recent network activity")
+            _onli=$((connects - disconnects))
+            [[ $_onli -lt 0 ]] && _onli=0
         fi
     fi
     
@@ -163,7 +165,7 @@ stop_online_monitor() {
     fi
 }
 
-# Enhanced connection tracking (for detailed logging)
+# Enhanced connection tracking (improved parsing)
 track_connections() {
     echo -e "${BLUE}Starting detailed connection tracker...${NC}"
     
@@ -180,46 +182,56 @@ track_connections() {
     journalctl -u hysteria-server -f -n 0 --no-pager 2>/dev/null | while read -r line; do
         local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
         
-        # Match connection patterns
-        if echo "$line" | grep -qiE "client.*connect|new.*connection|accept.*client|session.*start|authenticated|auth.*success"; then
-            local ip=$(echo "$line" | grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}' | head -1)
-            local port=$(echo "$line" | grep -oE ':([0-9]{4,5})' | head -1 | tr -d ':')
+        # Improved connect matching and extraction
+        if echo "$line" | grep -qiE "client.*connect|new.*connection|accept.*client|session.*start|authenticated|auth.*success|user.*connected"; then
+            # Extract IP and port more reliably (assuming format like ip:port)
+            local addr=$(echo "$line" | grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}:[0-9]{4,5}' | head -1)
+            local ip=$(echo "$addr" | cut -d: -f1)
+            local port=$(echo "$addr" | cut -d: -f2)
             
-            if [[ -n "$ip" ]]; then
-                local session_id="${ip}_${port}_$(date +%s%N)"
+            if [[ -n "$ip" && -n "$port" ]]; then
+                local session_id="${ip}_${port}_$(date +%s)"
                 
-                # Try to extract username from log
-                local username=$(echo "$line" | grep -oP 'user[=:\s]+\K[^\s,"\]]+' | head -1)
+                # Extract username more reliably
+                local username=$(echo "$line" | grep -oP '(user|username|auth)[=:\s]*\K([^\s,",\]]+)' | head -1 | tr -d "'\"")
                 
-                # If no username, check database for matching user
-                if [[ -z "$username" || "$username" == "null" ]]; then
-                    # Try to find username from database based on recent activity
-                    username=$(sqlite3 "$USER_DB" "SELECT username FROM users LIMIT 1;" 2>/dev/null)
-                    [[ -z "$username" ]] && username="user_${ip}"
+                if [[ -z "$username" ]]; then
+                    username="unknown"
+                else
+                    # Verify if user exists in DB
+                    local user_exists=$(sqlite3 "$USER_DB" "SELECT COUNT(*) FROM users WHERE username='$username';" 2>/dev/null || echo "0")
+                    [[ "$user_exists" -eq 0 ]] && username="unknown_$username"
                 fi
                 
                 (
                     flock -x 200
-                    sqlite3 "$USER_DB" "INSERT INTO online_sessions (session_id, username, ip_address, port, connect_time, status) VALUES ('$session_id', '$username', '$ip', ${port:-0}, '$timestamp', 'online');" 2>/dev/null
-                    echo "$timestamp - $username ($ip:${port:-unknown}) connected [Session: $session_id]" >> "$ONLINE_USERS_FILE"
+                    sqlite3 "$USER_DB" "INSERT INTO online_sessions (session_id, username, ip_address, port, connect_time, status) VALUES ('$session_id', '$username', '$ip', $port, '$timestamp', 'online');" 2>/dev/null
+                    echo "$timestamp - $username ($ip:$port) connected [Session: $session_id]" >> "$ONLINE_USERS_FILE"
                 ) 200>/var/lock/udp_sessions.lock
                 
-                echo -e "${GREEN}[CONNECT]${NC} $username from $ip:${port:-unknown}"
+                echo -e "${GREEN}[CONNECT]${NC} $username from $ip:$port"
             fi
             
-        elif echo "$line" | grep -qiE "client.*disconnect|connection.*clos|session.*end|client.*left|timeout.*no recent network activity"; then
-            local ip=$(echo "$line" | grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}' | head -1)
+        # Improved disconnect matching and extraction
+        elif echo "$line" | grep -qiE "client.*disconnect|connection.*clos|session.*end|client.*left|timeout.*no recent network activity|disconnected"; then
+            local addr=$(echo "$line" | grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}:[0-9]{4,5}' | head -1)
+            local ip=$(echo "$addr" | cut -d: -f1)
+            local port=$(echo "$addr" | cut -d: -f2)
             
             if [[ -n "$ip" ]]; then
                 (
                     flock -x 200
-                    local session_id=$(sqlite3 "$USER_DB" "SELECT session_id FROM online_sessions WHERE ip_address='$ip' AND status='online' ORDER BY connect_time DESC LIMIT 1;" 2>/dev/null)
+                    local query="SELECT session_id FROM online_sessions WHERE ip_address='$ip' AND status='online' ORDER BY connect_time DESC LIMIT 1;"
+                    if [[ -n "$port" ]]; then
+                        query="SELECT session_id FROM online_sessions WHERE ip_address='$ip' AND port='$port' AND status='online' ORDER BY connect_time DESC LIMIT 1;"
+                    fi
+                    local session_id=$(sqlite3 "$USER_DB" "$query" 2>/dev/null)
                     
                     if [[ -n "$session_id" ]]; then
                         sqlite3 "$USER_DB" "UPDATE online_sessions SET disconnect_time='$timestamp', status='offline' WHERE session_id='$session_id';" 2>/dev/null
                         local username=$(sqlite3 "$USER_DB" "SELECT username FROM online_sessions WHERE session_id='$session_id';" 2>/dev/null)
-                        echo "$timestamp - $username ($ip) disconnected [Session: $session_id]" >> "$ONLINE_USERS_FILE"
-                        echo -e "${YELLOW}[DISCONNECT]${NC} $username from $ip"
+                        echo "$timestamp - $username ($ip:${port:-unknown}) disconnected [Session: $session_id]" >> "$ONLINE_USERS_FILE"
+                        echo -e "${YELLOW}[DISCONNECT]${NC} $username from $ip:${port:-unknown}"
                     fi
                 ) 200>/var/lock/udp_sessions.lock
             fi
@@ -629,26 +641,6 @@ init_database
 # Main loop
 show_banner
 
-# Auto-start monitors if not running
-echo -e "${YELLOW}Checking monitors...${NC}"
-
-# Start connection tracker first (for accurate counting)
-if ! is_tracker_running; then
-    echo -e "${YELLOW}Auto-starting connection tracker...${NC}"
-    start_connection_tracker
-    sleep 2
-fi
-
-# Then start online monitor
-if [[ ! -f "$MONITOR_PID_FILE" ]] || ! ps -p "$(cat $MONITOR_PID_FILE 2>/dev/null)" > /dev/null 2>&1; then
-    echo -e "${YELLOW}Auto-starting online monitor...${NC}"
-    start_online_monitor
-    sleep 2
-fi
-
-echo -e "${GREEN}✓ All monitors are ready${NC}"
-sleep 2
-
 while true; do
     show_menu
     read -r choice
@@ -676,7 +668,7 @@ while true; do
         20) cleanup_sessions ;;
         21) uninstall_server ;;
         22) 
-            echo -e "${YELLOW}Exiting... (monitors will continue running in background)${NC}"
+            echo -e "${YELLOW}Exiting... (monitors will continue running in background if started)${NC}"
             clear
             exit 0
             ;;
