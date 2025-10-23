@@ -123,55 +123,52 @@ stop_online_monitor() {
     pkill -f "online monitor" 2>/dev/null
 }
 
-# FIXED: Enhanced connection tracking
 track_connections() {
-    # Get Hysteria port
-    local HYSTERIA_PORT=$(jq -r '.listen' "$CONFIG_FILE" 2>/dev/null | sed 's/^://' | cut -d: -f1)
-    [[ -z "$HYSTERIA_PORT" ]] && HYSTERIA_PORT="36712"
-    
     # Clear stale connections on startup
     sqlite3 "$USER_DB" "UPDATE online_sessions SET status='offline', disconnect_time=datetime('now') WHERE status='online';"
     
-    # Track using journalctl
+    # Track active IPs
+    declare -A active_ips
+    
     journalctl -u hysteria-server -f -n 0 --no-pager 2>/dev/null | while read -r line; do
-        local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+        timestamp=$(date '+%Y-%m-%d %H:%M:%S')
         
-        # Match connection patterns
-        if echo "$line" | grep -qiE "client.*connect|new.*connection|accept.*client|session.*start|authenticated"; then
-            local ip=$(echo "$line" | grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}' | head -1)
-            local port=$(echo "$line" | grep -oE ':([0-9]{4,5})' | head -1 | tr -d ':')
+        # Extract source IP from [src:IP:PORT] and detect TCP request
+        if echo "$line" | grep -q "TCP request"; then
+            ip=$(echo "$line" | grep -oP '\[src:\K[0-9.]+(?=:)')
             
-            if [[ -n "$ip" ]]; then
-                local session_id="${ip}_${port}_$(date +%s%N)"
-                local username=$(echo "$line" | grep -oP 'user[=:]?\s*\K[^\s,]+' | head -1)
+            if [[ -n "$ip" ]] && [[ -z "${active_ips[$ip]}" ]]; then
+                session_id="${ip}_$(date +%s%N)"
                 
-                if [[ -z "$username" || "$username" == "null" ]]; then
-                    # Try to match with database users
-                    username=$(sqlite3 "$USER_DB" "SELECT username FROM users LIMIT 1;" 2>/dev/null)
-                    [[ -z "$username" ]] && username="user_${ip}"
-                fi
+                # Get actual username from database
+                username=$(sqlite3 "$USER_DB" "SELECT username FROM users LIMIT 1;" 2>/dev/null)
+                [[ -z "$username" ]] && username="user_${ip}"
+                
+                active_ips[$ip]=$session_id
                 
                 (
                     flock -x 200
-                    sqlite3 "$USER_DB" "INSERT INTO online_sessions (session_id, username, ip_address, port, connect_time, status) VALUES ('$session_id', '$username', '$ip', ${port:-0}, '$timestamp', 'online');" 2>/dev/null
-                    echo "$timestamp - $username ($ip:${port:-unknown}) connected [Session: $session_id]" >> "$ONLINE_USERS_FILE"
+                    sqlite3 "$USER_DB" "INSERT INTO online_sessions (session_id, username, ip_address, connect_time, status) VALUES ('$session_id', '$username', '$ip', '$timestamp', 'online');" 2>/dev/null
+                    echo "$timestamp - $username ($ip) connected [Session: $session_id]" >> "$ONLINE_USERS_FILE"
                 ) 200>/var/lock/udp_sessions.lock
             fi
+        fi
+        
+        # Detect disconnect with TCP EOF
+        if echo "$line" | grep -q "TCP EOF"; then
+            ip=$(echo "$line" | grep -oP '\[src:\K[0-9.]+(?=:)')
             
-        elif echo "$line" | grep -qiE "client.*disconnect|connection.*clos|TCP EOF|session.*end|client.*left"; then
-            local ip=$(echo "$line" | grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}' | head -1)
-            
-            if [[ -n "$ip" ]]; then
+            if [[ -n "$ip" ]] && [[ -n "${active_ips[$ip]}" ]]; then
+                session_id="${active_ips[$ip]}"
+                
                 (
                     flock -x 200
-                    local session_id=$(sqlite3 "$USER_DB" "SELECT session_id FROM online_sessions WHERE ip_address='$ip' AND status='online' ORDER BY connect_time DESC LIMIT 1;" 2>/dev/null)
-                    
-                    if [[ -n "$session_id" ]]; then
-                        sqlite3 "$USER_DB" "UPDATE online_sessions SET disconnect_time='$timestamp', status='offline' WHERE session_id='$session_id';" 2>/dev/null
-                        local username=$(sqlite3 "$USER_DB" "SELECT username FROM online_sessions WHERE session_id='$session_id';" 2>/dev/null)
-                        echo "$timestamp - $username ($ip) disconnected [Session: $session_id]" >> "$ONLINE_USERS_FILE"
-                    fi
+                    sqlite3 "$USER_DB" "UPDATE online_sessions SET disconnect_time='$timestamp', status='offline' WHERE session_id='$session_id';" 2>/dev/null
+                    username=$(sqlite3 "$USER_DB" "SELECT username FROM online_sessions WHERE session_id='$session_id';" 2>/dev/null)
+                    echo "$timestamp - $username ($ip) disconnected [Session: $session_id]" >> "$ONLINE_USERS_FILE"
                 ) 200>/var/lock/udp_sessions.lock
+                
+                unset active_ips[$ip]
             fi
         fi
     done
