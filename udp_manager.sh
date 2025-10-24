@@ -59,24 +59,47 @@ update_userpass_config() {
     jq ".auth.config = [$user_array]" "$CONFIG_FILE" > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" "$CONFIG_FILE"
 }
 
-# FIXED: Background loop monitoring - Uses database only
 fun_online() {
-    # Count ONLY from database (connection tracker updates this)
+    # Get Hysteria port from config - FIXED parsing
+    local HYSTERIA_PORT=$(jq -r '.listen' "$CONFIG_FILE" 2>/dev/null | sed 's/^://' | cut -d: -f1)
+    
+    if [[ -z "$HYSTERIA_PORT" || "$HYSTERIA_PORT" == "null" ]]; then
+        HYSTERIA_PORT="36712"  # Default port
+    fi
+    
+    # Count active UDP connections on Hysteria port
+    local _udp_count=0
+    
+    # Method 1: Using ss command (faster and more reliable)
+    if command -v ss >/dev/null 2>&1; then
+        _udp_count=$(ss -un | grep ":$HYSTERIA_PORT " | wc -l)
+    # Method 2: Using netstat as fallback
+    elif command -v netstat >/dev/null 2>&1; then
+        _udp_count=$(netstat -un | grep ":$HYSTERIA_PORT " | wc -l)
+    fi
+    
+    # Count from database sessions (if tracking is enabled)
     local _db_count=0
     if [[ -f "$USER_DB" ]]; then
         _db_count=$(sqlite3 "$USER_DB" "SELECT COUNT(DISTINCT session_id) FROM online_sessions WHERE status='online';" 2>/dev/null || echo "0")
     fi
     
-    _onli=$_db_count
+    # Use the higher count (more accurate)
+    if [[ $_db_count -gt $_udp_count ]]; then
+        _onli=$_db_count
+    else
+        _onli=$_udp_count
+    fi
     
     # Format the output
     _onlin=$(printf '%-5s' "$_onli")
     CURRENT_ONLINES="$(echo -e "${_onlin}" | sed -e 's/[[:space:]]*$//')"
     
-    # Write to web files
+    # Write to web files (SSH script format)
     echo "{\"onlines\":\"$CURRENT_ONLINES\",\"limite\":\"2500\"}" > "$WEB_APP_FILE"
     echo "$CURRENT_ONLINES" > "$WEB_STATUS_FILE"
     
+    # Set proper permissions
     chmod 644 "$WEB_STATUS_FILE" 2>/dev/null
     chmod 644 "$WEB_APP_FILE" 2>/dev/null
 }
@@ -88,18 +111,13 @@ start_online_monitor() {
     # Stop existing monitor if running
     stop_online_monitor
     
-    # Start background loop with nohup
-    nohup bash -c "
+    # Start background loop
+    (
         while true; do
-            _db_count=\$(sqlite3 '$USER_DB' \"SELECT COUNT(DISTINCT session_id) FROM online_sessions WHERE status='online';\" 2>/dev/null || echo '0')
-            _onlin=\$(printf '%-5s' \"\$_db_count\")
-            CURRENT_ONLINES=\"\$(echo -e \"\${_onlin}\" | sed -e 's/[[:space:]]*\$//')\"
-            echo \"{\\\"onlines\\\":\\\"\$CURRENT_ONLINES\\\",\\\"limite\\\":\\\"2500\\\"}\" > '$WEB_APP_FILE'
-            echo \"\$CURRENT_ONLINES\" > '$WEB_STATUS_FILE'
-            chmod 644 '$WEB_STATUS_FILE' '$WEB_APP_FILE' 2>/dev/null
-            sleep 15
+            fun_online > /dev/null 2>&1
+            sleep 15s
         done
-    " > /dev/null 2>&1 &
+    ) &
     
     # Save PID
     echo $! > "$MONITOR_PID_FILE"
@@ -119,80 +137,73 @@ stop_online_monitor() {
         fi
         rm -f "$MONITOR_PID_FILE"
     fi
-    # Kill any remaining processes
-    pkill -f "online monitor" 2>/dev/null
 }
 
+# Enhanced connection tracking (for detailed logging)
 track_connections() {
+    echo -e "${BLUE}Starting detailed connection tracker...${NC}"
+    
+    # Get Hysteria port - FIXED
+    local HYSTERIA_PORT=$(jq -r '.listen' "$CONFIG_FILE" 2>/dev/null | sed 's/^://' | cut -d: -f1)
+    [[ -z "$HYSTERIA_PORT" ]] && HYSTERIA_PORT="36712"
+    
+    echo -e "${CYAN}Monitoring port: $HYSTERIA_PORT${NC}"
+    
     # Clear stale connections on startup
     sqlite3 "$USER_DB" "UPDATE online_sessions SET status='offline', disconnect_time=datetime('now') WHERE status='online';"
     
-    # Track active IPs
-    declare -A active_ips
-    
     journalctl -u hysteria-server -f -n 0 --no-pager 2>/dev/null | while read -r line; do
-        timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+        local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
         
-        # Extract source IP from [src:IP:PORT] and detect TCP request
-        if echo "$line" | grep -q "TCP request"; then
-            ip=$(echo "$line" | grep -oP '\[src:\K[0-9.]+(?=:)')
+        # Match connection patterns
+        if echo "$line" | grep -qiE "client.*connect|new.*connection|accept.*client|session.*start"; then
+            local ip=$(echo "$line" | grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}' | head -1)
+            local port=$(echo "$line" | grep -oE ':([0-9]{4,5})' | head -1 | tr -d ':')
             
-            if [[ -n "$ip" ]] && [[ -z "${active_ips[$ip]}" ]]; then
-                session_id="${ip}_$(date +%s%N)"
+            if [[ -n "$ip" ]]; then
+                local session_id="${ip}_${port}_$(date +%s%N)"
+                local username=$(echo "$line" | grep -oP 'user[=:]?\s*\K[^\s,]+' | head -1)
                 
-                # Get actual username from database
-                username=$(sqlite3 "$USER_DB" "SELECT username FROM users LIMIT 1;" 2>/dev/null)
-                [[ -z "$username" ]] && username="user_${ip}"
-                
-                active_ips[$ip]=$session_id
+                if [[ -z "$username" || "$username" == "null" ]]; then
+                    username="user_${ip}"
+                fi
                 
                 (
                     flock -x 200
-                    sqlite3 "$USER_DB" "INSERT INTO online_sessions (session_id, username, ip_address, connect_time, status) VALUES ('$session_id', '$username', '$ip', '$timestamp', 'online');" 2>/dev/null
-                    echo "$timestamp - $username ($ip) connected [Session: $session_id]" >> "$ONLINE_USERS_FILE"
+                    sqlite3 "$USER_DB" "INSERT INTO online_sessions (session_id, username, ip_address, port, connect_time, status) VALUES ('$session_id', '$username', '$ip', ${port:-0}, '$timestamp', 'online');" 2>/dev/null
+                    echo "$timestamp - $username ($ip:${port:-unknown}) connected [Session: $session_id]" >> "$ONLINE_USERS_FILE"
                 ) 200>/var/lock/udp_sessions.lock
+                
+                echo -e "${GREEN}[CONNECT]${NC} $username from $ip:${port:-unknown}"
             fi
-        fi
-        
-        # Detect disconnect with TCP EOF
-        if echo "$line" | grep -q "TCP EOF"; then
-            ip=$(echo "$line" | grep -oP '\[src:\K[0-9.]+(?=:)')
             
-            if [[ -n "$ip" ]] && [[ -n "${active_ips[$ip]}" ]]; then
-                session_id="${active_ips[$ip]}"
-                
+        elif echo "$line" | grep -qiE "client.*disconnect|connection.*clos|TCP EOF|session.*end|client.*left"; then
+            local ip=$(echo "$line" | grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}' | head -1)
+            
+            if [[ -n "$ip" ]]; then
                 (
                     flock -x 200
-                    sqlite3 "$USER_DB" "UPDATE online_sessions SET disconnect_time='$timestamp', status='offline' WHERE session_id='$session_id';" 2>/dev/null
-                    username=$(sqlite3 "$USER_DB" "SELECT username FROM online_sessions WHERE session_id='$session_id';" 2>/dev/null)
-                    echo "$timestamp - $username ($ip) disconnected [Session: $session_id]" >> "$ONLINE_USERS_FILE"
+                    local session_id=$(sqlite3 "$USER_DB" "SELECT session_id FROM online_sessions WHERE ip_address='$ip' AND status='online' ORDER BY connect_time DESC LIMIT 1;" 2>/dev/null)
+                    
+                    if [[ -n "$session_id" ]]; then
+                        sqlite3 "$USER_DB" "UPDATE online_sessions SET disconnect_time='$timestamp', status='offline' WHERE session_id='$session_id';" 2>/dev/null
+                        local username=$(sqlite3 "$USER_DB" "SELECT username FROM online_sessions WHERE session_id='$session_id';" 2>/dev/null)
+                        echo "$timestamp - $username ($ip) disconnected [Session: $session_id]" >> "$ONLINE_USERS_FILE"
+                        echo -e "${YELLOW}[DISCONNECT]${NC} $username from $ip"
+                    fi
                 ) 200>/var/lock/udp_sessions.lock
-                
-                unset active_ips[$ip]
             fi
         fi
     done
 }
 
-# FIXED: Start detailed tracking with nohup
+# Start detailed tracking
 start_connection_tracker() {
     echo -e "${BLUE}Starting detailed connection tracker...${NC}"
     
     stop_connection_tracker
     
-    # Enable logging in Hysteria config first
-    if [[ -f "$CONFIG_FILE" ]]; then
-        local has_log=$(jq -r '.log' "$CONFIG_FILE" 2>/dev/null)
-        if [[ "$has_log" == "null" ]]; then
-            echo -e "${YELLOW}Enabling Hysteria logging...${NC}"
-            jq '. + {"log": {"level": "info", "file": "/var/log/hysteria/hysteria.log"}}' "$CONFIG_FILE" > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" "$CONFIG_FILE"
-            systemctl restart hysteria-server
-            sleep 2
-        fi
-    fi
-    
-    # Start tracker in background with nohup
-    nohup bash -c "$(declare -f track_connections); track_connections" > /dev/null 2>&1 &
+    (track_connections) &
     echo $! > "$TRACKER_PID_FILE"
     
     echo -e "${GREEN}✓ Connection tracker started (PID: $(cat $TRACKER_PID_FILE))${NC}"
@@ -209,7 +220,6 @@ stop_connection_tracker() {
         fi
         rm -f "$TRACKER_PID_FILE"
     fi
-    pkill -f "track_connections" 2>/dev/null
     pkill -f "journalctl -u hysteria-server -f" 2>/dev/null
 }
 
@@ -536,7 +546,7 @@ show_banner() {
     clear
     echo -e "${BLUE}═══════════════════════════════════════════${NC}"
     echo -e "${CYAN}   UDP Manager with Background Monitoring${NC}"
-    echo -e "${GREEN}   Simple Loop Style - v2.1 FIXED${NC}"
+    echo -e "${GREEN}   Simple Loop Style - v2.0${NC}"
     echo -e "${YELLOW}   (c) 2025 - @sansoe2021${NC}"
     echo -e "${BLUE}═══════════════════════════════════════════${NC}"
 }
@@ -576,16 +586,10 @@ init_database
 # Main loop
 show_banner
 
-# FIXED: Auto-start both monitors
+# Auto-start online monitor if not running
 if [[ ! -f "$MONITOR_PID_FILE" ]] || ! ps -p "$(cat $MONITOR_PID_FILE 2>/dev/null)" > /dev/null 2>&1; then
     echo -e "${YELLOW}Auto-starting online monitor...${NC}"
     start_online_monitor
-    sleep 2
-fi
-
-if [[ ! -f "$TRACKER_PID_FILE" ]] || ! ps -p "$(cat $TRACKER_PID_FILE 2>/dev/null)" > /dev/null 2>&1; then
-    echo -e "${YELLOW}Auto-starting connection tracker...${NC}"
-    start_connection_tracker
     sleep 2
 fi
 
