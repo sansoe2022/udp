@@ -115,43 +115,6 @@ stop_online_monitor() {
     fi
 }
 
-# Start connection tracker (uses systemd service)
-start_connection_tracker() {
-    echo -e "${BLUE}Starting connection tracker...${NC}"
-    
-    # Check if service exists
-    if [[ ! -f "/etc/systemd/system/hysteria-tracker.service" ]]; then
-        echo -e "${YELLOW}Creating hysteria-tracker systemd service...${NC}"
-        setup_tracker_service
-    fi
-    
-    # Start service
-    systemctl start hysteria-tracker
-    
-    if systemctl is-active hysteria-tracker >/dev/null 2>&1; then
-        echo -e "${GREEN}✓ Connection tracker started (systemd service)${NC}"
-        echo -e "${CYAN}Service: hysteria-tracker${NC}"
-        echo -e "${CYAN}View logs: journalctl -u hysteria-tracker -f${NC}"
-        echo -e "${CYAN}Connection log: tail -f $ONLINE_USERS_FILE${NC}"
-    else
-        echo -e "${RED}✗ Failed to start tracker${NC}"
-        echo -e "${YELLOW}Check status: systemctl status hysteria-tracker${NC}"
-    fi
-}
-
-# Stop connection tracker
-stop_connection_tracker() {
-    echo -e "${BLUE}Stopping connection tracker...${NC}"
-    
-    systemctl stop hysteria-tracker
-    
-    if ! systemctl is-active hysteria-tracker >/dev/null 2>&1; then
-        echo -e "${GREEN}✓ Connection tracker stopped${NC}"
-    else
-        echo -e "${RED}✗ Failed to stop tracker${NC}"
-    fi
-}
-
 # Setup tracker systemd service
 setup_tracker_service() {
     echo -e "${BLUE}Setting up hysteria-tracker service...${NC}"
@@ -257,6 +220,43 @@ TRACKEREOF
     echo -e "${GREEN}✓ Hysteria-tracker service created${NC}"
 }
 
+# Start connection tracker (uses systemd service)
+start_connection_tracker() {
+    echo -e "${BLUE}Starting connection tracker...${NC}"
+    
+    # Check if service exists
+    if [[ ! -f "/etc/systemd/system/hysteria-tracker.service" ]]; then
+        echo -e "${YELLOW}Creating hysteria-tracker systemd service...${NC}"
+        setup_tracker_service
+    fi
+    
+    # Start service
+    systemctl start hysteria-tracker
+    
+    if systemctl is-active hysteria-tracker >/dev/null 2>&1; then
+        echo -e "${GREEN}✓ Connection tracker started (systemd service)${NC}"
+        echo -e "${CYAN}Service: hysteria-tracker${NC}"
+        echo -e "${CYAN}View logs: journalctl -u hysteria-tracker -f${NC}"
+        echo -e "${CYAN}Connection log: tail -f $ONLINE_USERS_FILE${NC}"
+    else
+        echo -e "${RED}✗ Failed to start tracker${NC}"
+        echo -e "${YELLOW}Check status: systemctl status hysteria-tracker${NC}"
+    fi
+}
+
+# Stop connection tracker
+stop_connection_tracker() {
+    echo -e "${BLUE}Stopping connection tracker...${NC}"
+    
+    systemctl stop hysteria-tracker
+    
+    if ! systemctl is-active hysteria-tracker >/dev/null 2>&1; then
+        echo -e "${GREEN}✓ Connection tracker stopped${NC}"
+    else
+        echo -e "${RED}✗ Failed to stop tracker${NC}"
+    fi
+}
+
 # Check monitor status
 check_monitor_status() {
     echo -e "\n${BLUE}═══ Monitoring Status ═══${NC}"
@@ -297,6 +297,13 @@ check_monitor_status() {
     # Current online users
     local online_count=$(sqlite3 "$USER_DB" "SELECT COUNT(*) FROM online_sessions WHERE status='online';" 2>/dev/null || echo "0")
     echo -e "${CYAN}Current online users: $online_count${NC}"
+    
+    # Show web URLs
+    local server_ip=$(curl -s ifconfig.me 2>/dev/null || hostname -I | awk '{print $1}')
+    if [[ -n "$server_ip" ]]; then
+        echo -e "${CYAN}Web Dashboard: http://${server_ip}/udpserver/${NC}"
+        echo -e "${CYAN}API Endpoint: http://${server_ip}/udpserver/online${NC}"
+    fi
 }
 
 # Show online users
@@ -358,7 +365,33 @@ show_user_history() {
 setup_web_server() {
     echo -e "\n${BLUE}Setting up web server for online status...${NC}"
     
-    # Create nginx config
+    # Check if nginx is installed
+    if ! command -v nginx &> /dev/null; then
+        echo -e "${YELLOW}Nginx not found. Installing...${NC}"
+        apt update
+        apt install -y nginx
+        
+        if [[ $? -ne 0 ]]; then
+            echo -e "${RED}✗ Failed to install nginx${NC}"
+            return 1
+        fi
+        
+        systemctl start nginx
+        systemctl enable nginx
+        echo -e "${GREEN}✓ Nginx installed${NC}"
+    fi
+    
+    # Create nginx directories if they don't exist
+    mkdir -p /etc/nginx/sites-available
+    mkdir -p /etc/nginx/sites-enabled
+    
+    # Check if sites-enabled is included in nginx.conf
+    if ! grep -q "sites-enabled" /etc/nginx/nginx.conf; then
+        echo -e "${YELLOW}Adding sites-enabled to nginx.conf...${NC}"
+        sed -i '/include \/etc\/nginx\/conf.d\/\*.conf;/a \    include /etc/nginx/sites-enabled/*;' /etc/nginx/nginx.conf
+    fi
+    
+    # Create nginx config with proper content types
     cat > /etc/nginx/sites-available/udp-status << 'NGINXEOF'
 server {
     listen 80;
@@ -366,14 +399,34 @@ server {
     
     root /var/www/html;
     
+    # Main location
     location /udpserver/ {
         autoindex on;
+        add_header Access-Control-Allow-Origin *;
+        add_header Cache-Control "no-cache, no-store, must-revalidate";
+    }
+    
+    # Plain text API endpoint
+    location = /udpserver/online {
+        default_type text/plain;
+        add_header Content-Type "text/plain; charset=utf-8";
+        add_header Access-Control-Allow-Origin *;
+        add_header Cache-Control "no-cache, no-store, must-revalidate";
+    }
+    
+    # JSON API endpoint
+    location = /udpserver/online_app {
+        default_type application/json;
+        add_header Content-Type "application/json; charset=utf-8";
         add_header Access-Control-Allow-Origin *;
         add_header Cache-Control "no-cache, no-store, must-revalidate";
     }
 }
 NGINXEOF
 
+    # Remove default site if exists
+    rm -f /etc/nginx/sites-enabled/default
+    
     # Enable site
     ln -sf /etc/nginx/sites-available/udp-status /etc/nginx/sites-enabled/udp-status
     
@@ -386,15 +439,206 @@ NGINXEOF
     echo '{"onlines":"0","limite":"2500"}' > "$WEB_APP_FILE"
     chmod 644 "$WEB_STATUS_FILE" "$WEB_APP_FILE"
     
+    # Create HTML dashboard
+    cat > "$WEB_DIR/index.html" << 'HTMLEOF'
+<!DOCTYPE html>
+<html>
+<head>
+    <title>UDP Server Status</title>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            min-height: 100vh;
+            padding: 20px;
+        }
+        .container {
+            background: rgba(255, 255, 255, 0.95);
+            padding: 60px 80px;
+            border-radius: 20px;
+            box-shadow: 0 20px 60px rgba(0, 0, 0, 0.3);
+            text-align: center;
+            max-width: 500px;
+            width: 100%;
+        }
+        h1 {
+            color: #333;
+            margin-bottom: 10px;
+            font-size: 28px;
+        }
+        .subtitle {
+            color: #666;
+            font-size: 14px;
+            margin-bottom: 40px;
+        }
+        .count-wrapper {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            padding: 40px;
+            border-radius: 15px;
+            margin: 30px 0;
+            box-shadow: 0 10px 30px rgba(102, 126, 234, 0.4);
+        }
+        .count {
+            font-size: 100px;
+            color: #fff;
+            font-weight: bold;
+            line-height: 1;
+            text-shadow: 0 5px 15px rgba(0, 0, 0, 0.2);
+        }
+        .label {
+            font-size: 18px;
+            color: rgba(255, 255, 255, 0.9);
+            margin-top: 15px;
+            text-transform: uppercase;
+            letter-spacing: 2px;
+        }
+        .info {
+            display: flex;
+            justify-content: space-around;
+            margin-top: 30px;
+            padding-top: 30px;
+            border-top: 1px solid #e0e0e0;
+        }
+        .info-item {
+            text-align: center;
+        }
+        .info-label {
+            color: #999;
+            font-size: 12px;
+            margin-bottom: 5px;
+            text-transform: uppercase;
+        }
+        .info-value {
+            color: #333;
+            font-size: 16px;
+            font-weight: bold;
+        }
+        .status {
+            display: inline-block;
+            width: 12px;
+            height: 12px;
+            background: #4caf50;
+            border-radius: 50%;
+            margin-right: 8px;
+            animation: pulse 2s infinite;
+        }
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.5; }
+        }
+        .footer {
+            margin-top: 30px;
+            color: #999;
+            font-size: 12px;
+        }
+        .api-links {
+            margin-top: 20px;
+            padding: 20px;
+            background: #f5f5f5;
+            border-radius: 10px;
+        }
+        .api-link {
+            display: block;
+            color: #667eea;
+            text-decoration: none;
+            padding: 8px;
+            font-size: 13px;
+            transition: color 0.3s;
+        }
+        .api-link:hover {
+            color: #764ba2;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>UDP Server Monitor</h1>
+        <p class="subtitle"><span class="status"></span>Live Status</p>
+        
+        <div class="count-wrapper">
+            <div class="count" id="count">--</div>
+            <div class="label">Online Users</div>
+        </div>
+        
+        <div class="info">
+            <div class="info-item">
+                <div class="info-label">Update</div>
+                <div class="info-value">5s</div>
+            </div>
+            <div class="info-item">
+                <div class="info-label">Limit</div>
+                <div class="info-value" id="limit">2500</div>
+            </div>
+            <div class="info-item">
+                <div class="info-label">Status</div>
+                <div class="info-value" style="color: #4caf50;">Active</div>
+            </div>
+        </div>
+        
+        <div class="api-links">
+            <strong style="color: #333; font-size: 14px;">API Endpoints:</strong>
+            <a href="/udpserver/online" class="api-link" target="_blank">📊 Plain Text API</a>
+            <a href="/udpserver/online_app" class="api-link" target="_blank">📋 JSON API</a>
+        </div>
+        
+        <div class="footer">
+            Auto-refresh every 5 seconds
+        </div>
+    </div>
+    
+    <script>
+        async function updateCount() {
+            try {
+                const response = await fetch('/udpserver/online_app');
+                const data = await response.json();
+                document.getElementById('count').textContent = data.onlines;
+                document.getElementById('limit').textContent = data.limite;
+            } catch (error) {
+                document.getElementById('count').textContent = 'Error';
+                console.error('Failed to fetch data:', error);
+            }
+        }
+        
+        updateCount();
+        setInterval(updateCount, 5000);
+    </script>
+</body>
+</html>
+HTMLEOF
+
+    chmod 644 "$WEB_DIR/index.html"
+    
     # Test nginx config
+    echo -e "${CYAN}Testing nginx configuration...${NC}"
     nginx -t
     
-    # Reload nginx
-    systemctl reload nginx
-    
-    echo -e "${GREEN}✓ Web server configured${NC}"
-    echo -e "${CYAN}Access at: http://YOUR_SERVER_IP/udpserver/online${NC}"
-    echo -e "${CYAN}JSON API: http://YOUR_SERVER_IP/udpserver/online_app${NC}"
+    if [[ $? -eq 0 ]]; then
+        # Reload nginx
+        systemctl reload nginx
+        echo -e "${GREEN}✓ Web server configured successfully${NC}"
+        
+        # Get server IP
+        local server_ip=$(curl -s ifconfig.me 2>/dev/null || hostname -I | awk '{print $1}')
+        echo -e "${CYAN}─────────────────────────────────────${NC}"
+        echo -e "${GREEN}Access URLs:${NC}"
+        echo -e "${CYAN}Dashboard:  http://${server_ip}/udpserver/${NC}"
+        echo -e "${CYAN}Text API:   http://${server_ip}/udpserver/online${NC}"
+        echo -e "${CYAN}JSON API:   http://${server_ip}/udpserver/online_app${NC}"
+        echo -e "${CYAN}─────────────────────────────────────${NC}"
+    else
+        echo -e "${RED}✗ Nginx configuration test failed${NC}"
+        return 1
+    fi
 }
 
 # User management
