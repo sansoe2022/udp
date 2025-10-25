@@ -10,7 +10,6 @@ WEB_DIR="/var/www/html/udpserver"
 WEB_STATUS_FILE="$WEB_DIR/online"
 WEB_APP_FILE="$WEB_DIR/online_app"
 MONITOR_PID_FILE="$CONFIG_DIR/.monitor_pid"
-TRACKER_PID_FILE="$CONFIG_DIR/.tracker_pid"
 
 mkdir -p "$CONFIG_DIR"
 mkdir -p "/var/log/hysteria"
@@ -60,48 +59,25 @@ update_userpass_config() {
 }
 
 fun_online() {
-    # Get Hysteria port from config - FIXED parsing
-    local HYSTERIA_PORT=$(jq -r '.listen' "$CONFIG_FILE" 2>/dev/null | sed 's/^://' | cut -d: -f1)
-    
-    if [[ -z "$HYSTERIA_PORT" || "$HYSTERIA_PORT" == "null" ]]; then
-        HYSTERIA_PORT="36712"  # Default port
-    fi
-    
-    # Count active UDP connections on Hysteria port
-    local _udp_count=0
-    
-    # Method 1: Using ss command (faster and more reliable)
-    if command -v ss >/dev/null 2>&1; then
-        _udp_count=$(ss -un | grep ":$HYSTERIA_PORT " | wc -l)
-    # Method 2: Using netstat as fallback
-    elif command -v netstat >/dev/null 2>&1; then
-        _udp_count=$(netstat -un | grep ":$HYSTERIA_PORT " | wc -l)
-    fi
-    
-    # Count from database sessions (if tracking is enabled)
-    local _db_count=0
+    # Database-based counting (primary method for QUIC)
+    local _onli=0
     if [[ -f "$USER_DB" ]]; then
-        _db_count=$(sqlite3 "$USER_DB" "SELECT COUNT(DISTINCT session_id) FROM online_sessions WHERE status='online';" 2>/dev/null || echo "0")
+        _onli=$(sqlite3 "$USER_DB" "SELECT COUNT(DISTINCT session_id) FROM online_sessions WHERE status='online' AND datetime(connect_time) > datetime('now', '-10 minutes');" 2>/dev/null || echo "0")
     fi
     
-    # Use the higher count (more accurate)
-    if [[ $_db_count -gt $_udp_count ]]; then
-        _onli=$_db_count
-    else
-        _onli=$_udp_count
-    fi
+    # Ensure non-negative
+    [[ $_onli -lt 0 ]] && _onli=0
     
-    # Format the output
+    # Format output
     _onlin=$(printf '%-5s' "$_onli")
     CURRENT_ONLINES="$(echo -e "${_onlin}" | sed -e 's/[[:space:]]*$//')"
     
-    # Write to web files (SSH script format)
+    # Write to web files
     echo "{\"onlines\":\"$CURRENT_ONLINES\",\"limite\":\"2500\"}" > "$WEB_APP_FILE"
     echo "$CURRENT_ONLINES" > "$WEB_STATUS_FILE"
     
-    # Set proper permissions
-    chmod 644 "$WEB_STATUS_FILE" 2>/dev/null
-    chmod 644 "$WEB_APP_FILE" 2>/dev/null
+    # Set permissions
+    chmod 644 "$WEB_STATUS_FILE" "$WEB_APP_FILE" 2>/dev/null
 }
 
 # Background monitoring loop
@@ -139,92 +115,27 @@ stop_online_monitor() {
     fi
 }
 
-
-track_connections() {
-    echo -e "${BLUE}Starting connection tracker (Timeout-based)...${NC}"
-    
-    local HYSTERIA_PORT=$(jq -r '.listen' "$CONFIG_FILE" 2>/dev/null | sed 's/^://' | cut -d: -f1)
-    [[ -z "$HYSTERIA_PORT" ]] && HYSTERIA_PORT="36712"
-    
-    echo -e "${CYAN}Monitoring port: $HYSTERIA_PORT${NC}"
-    echo -e "${YELLOW}Session timeout: 5 minutes of inactivity${NC}"
-    
-    # Clear stale connections
-    sqlite3 "$USER_DB" "UPDATE online_sessions SET status='offline', disconnect_time=datetime('now') WHERE status='online';"
-    
-    # Background timeout checker
-    (
-        while true; do
-            sleep 60
-            
-            local expired=$(sqlite3 "$USER_DB" "
-                UPDATE online_sessions 
-                SET status='offline', disconnect_time=datetime('now') 
-                WHERE status='online' 
-                AND datetime(connect_time) < datetime('now', '-5 minutes');
-                SELECT changes();
-            " 2>/dev/null)
-            
-            if [[ "$expired" -gt 0 ]]; then
-                local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
-                echo "$timestamp - Expired $expired session(s) due to inactivity" >> "$ONLINE_USERS_FILE"
-            fi
-        done
-    ) &
-    local timeout_pid=$!
-    
-    # Monitor for CONNECT events only (disconnect events don't exist in Hysteria logs)
-    journalctl -u hysteria-server -f -n 0 --no-pager 2>/dev/null | while read -r line; do
-        local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
-        
-        # Match: [INFO] [src:IP:PORT] Client connected
-        if echo "$line" | grep -q "Client connected"; then
-            local ip=$(echo "$line" | grep -oP '\[src:\K[0-9.]+(?=:)' | head -1)
-            local port=$(echo "$line" | grep -oP '\[src:[0-9.]+:\K[0-9]+(?=\])' | head -1)
-            
-            if [[ -n "$ip" ]]; then
-                local existing=$(sqlite3 "$USER_DB" "SELECT session_id FROM online_sessions WHERE ip_address='$ip' AND status='online' LIMIT 1;" 2>/dev/null)
-                
-                if [[ -n "$existing" ]]; then
-                    # Update timestamp (keep-alive)
-                    (
-                        flock -x 200
-                        sqlite3 "$USER_DB" "UPDATE online_sessions SET connect_time='$timestamp' WHERE session_id='$existing';" 2>/dev/null
-                    ) 200>/var/lock/udp_sessions.lock
-                    echo -e "${CYAN}[KEEPALIVE]${NC} user_${ip} from $ip:${port:-unknown}"
-                else
-                    # New connection
-                    local session_id="${ip}_${port}_$(date +%s%N)"
-                    local username="user_${ip}"
-                    
-                    (
-                        flock -x 200
-                        sqlite3 "$USER_DB" "INSERT INTO online_sessions (session_id, username, ip_address, port, connect_time, status) VALUES ('$session_id', '$username', '$ip', ${port:-0}, '$timestamp', 'online');" 2>/dev/null
-                        echo "$timestamp - $username ($ip:${port:-unknown}) connected [Session: $session_id]" >> "$ONLINE_USERS_FILE"
-                    ) 200>/var/lock/udp_sessions.lock
-                    
-                    echo -e "${GREEN}[CONNECT]${NC} $username from $ip:${port:-unknown}"
-                fi
-            fi
-        fi
-    done
-    
-    # Cleanup
-    kill $timeout_pid 2>/dev/null
-}
-
-# Start detailed tracking
+# Start connection tracker (uses systemd service)
 start_connection_tracker() {
-    echo -e "${BLUE}Starting detailed connection tracker...${NC}"
+    echo -e "${BLUE}Starting connection tracker...${NC}"
     
-    # Use systemd service instead
+    # Check if service exists
+    if [[ ! -f "/etc/systemd/system/hysteria-tracker.service" ]]; then
+        echo -e "${YELLOW}Creating hysteria-tracker systemd service...${NC}"
+        setup_tracker_service
+    fi
+    
+    # Start service
     systemctl start hysteria-tracker
     
     if systemctl is-active hysteria-tracker >/dev/null 2>&1; then
         echo -e "${GREEN}✓ Connection tracker started (systemd service)${NC}"
+        echo -e "${CYAN}Service: hysteria-tracker${NC}"
         echo -e "${CYAN}View logs: journalctl -u hysteria-tracker -f${NC}"
+        echo -e "${CYAN}Connection log: tail -f $ONLINE_USERS_FILE${NC}"
     else
         echo -e "${RED}✗ Failed to start tracker${NC}"
+        echo -e "${YELLOW}Check status: systemctl status hysteria-tracker${NC}"
     fi
 }
 
@@ -241,192 +152,261 @@ stop_connection_tracker() {
     fi
 }
 
+# Setup tracker systemd service
+setup_tracker_service() {
+    echo -e "${BLUE}Setting up hysteria-tracker service...${NC}"
+    
+    # Create service file
+    cat > /etc/systemd/system/hysteria-tracker.service << 'EOF'
+[Unit]
+Description=Hysteria Connection Tracker
+After=hysteria-server.service
+Requires=hysteria-server.service
 
-# Show online users
-show_online_users() {
-    echo -e "\n${BLUE}═══════════════════════════════════════${NC}"
-    echo -e "${CYAN}       Currently Online Users${NC}"
-    echo -e "${BLUE}═══════════════════════════════════════${NC}"
-    
-    # Get current online count
-    fun_online > /dev/null 2>&1
-    local online_count=$(cat "$WEB_STATUS_FILE" 2>/dev/null || echo "0")
-    
-    echo -e "${GREEN}╔══════════════════════════════════╗${NC}"
-    echo -e "${GREEN}║  ONLINE USERS COUNT: $(printf '%3d' $online_count)         ║${NC}"
-    echo -e "${GREEN}╚══════════════════════════════════╝${NC}"
-    
-    # Show detailed sessions from database if available
-    local db_count=$(sqlite3 "$USER_DB" "SELECT COUNT(*) FROM online_sessions WHERE status='online';" 2>/dev/null || echo "0")
-    
-    if [[ $db_count -gt 0 ]]; then
-        echo -e "\n${YELLOW}Detailed Sessions from Database:${NC}"
-        echo -e "${CYAN}Username\t\tIP Address\t\tConnect Time${NC}"
-        echo -e "${CYAN}--------\t\t----------\t\t------------${NC}"
-        sqlite3 "$USER_DB" "SELECT username, ip_address, connect_time FROM online_sessions WHERE status='online' ORDER BY connect_time DESC;" 2>/dev/null | while IFS='|' read -r username ip connect_time; do
-            printf "${GREEN}%-15s\t\t%-15s\t%s${NC}\n" "$username" "$ip" "$connect_time"
-        done
-    fi
-    
-    # Show web endpoint info
-    local server_ip=$(curl -s ifconfig.me 2>/dev/null || hostname -I | awk '{print $1}')
-    echo -e "\n${BLUE}═══ Web Status Endpoints ═══${NC}"
-    echo -e "${CYAN}Simple: http://$server_ip:81/udpserver/online${NC}"
-    echo -e "${CYAN}JSON:   http://$server_ip:81/udpserver/online_app${NC}"
-}
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/etc/hysteria
+ExecStart=/usr/local/bin/hysteria-tracker.sh
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
 
-# Show user connection history
-show_user_history() {
-    echo -e "\n${BLUE}Enter username to view history:${NC}"
-    read -r username
-    
-    echo -e "\n${BLUE}═══ Connection History for $username ═══${NC}"
-    local history_count=$(sqlite3 "$USER_DB" "SELECT COUNT(*) FROM online_sessions WHERE username='$username';" 2>/dev/null || echo "0")
-    
-    if [[ $history_count -gt 0 ]]; then
-        echo -e "${CYAN}IP Address\t\tConnect Time\t\t\tDisconnect Time\t\t\tStatus${NC}"
-        echo -e "${CYAN}----------\t\t------------\t\t\t---------------\t\t\t------${NC}"
-        sqlite3 "$USER_DB" "SELECT ip_address, connect_time, COALESCE(disconnect_time, 'Still Online'), status FROM online_sessions WHERE username='$username' ORDER BY connect_time DESC LIMIT 20;" 2>/dev/null | while IFS='|' read -r ip connect_time disconnect_time status; do
-            if [[ "$status" == "online" ]]; then
-                printf "${GREEN}%-15s\t%-24s\t%-24s\t%s${NC}\n" "$ip" "$connect_time" "$disconnect_time" "$status"
-            else
-                printf "${NC}%-15s\t%-24s\t%-24s\t%s${NC}\n" "$ip" "$connect_time" "$disconnect_time" "$status"
-            fi
-        done
-        echo -e "\n${CYAN}Total sessions: $history_count${NC}"
-    else
-        echo -e "${YELLOW}No connection history found for user $username.${NC}"
-        
-        # Check if user exists
-        local user_exists=$(sqlite3 "$USER_DB" "SELECT COUNT(*) FROM users WHERE username='$username';" 2>/dev/null || echo "0")
-        if [[ "$user_exists" -gt 0 ]]; then
-            echo -e "${BLUE}Note: User exists but has no connection history yet.${NC}"
-        else
-            echo -e "${RED}Warning: User '$username' not found in database.${NC}"
-        fi
-    fi
-}
-
-# Setup web server (nginx)
-setup_web_server() {
-    echo -e "\n${BLUE}Setting up web server...${NC}"
-    
-    # Install nginx if not installed
-    if ! command -v nginx &> /dev/null; then
-        echo -e "${YELLOW}Installing nginx...${NC}"
-        apt update && apt install -y nginx
-    fi
-    
-    # Create nginx config
-    cat > /etc/nginx/sites-available/udp-status << 'EOF'
-server {
-    listen 81;
-    server_name _;
-    root /var/www/html;
-    
-    location /udpserver/online {
-        default_type text/plain;
-        add_header Access-Control-Allow-Origin *;
-        add_header Cache-Control "no-cache, no-store, must-revalidate";
-        try_files /udpserver/online =404;
-    }
-    
-    location /udpserver/online_app {
-        default_type application/json;
-        add_header Access-Control-Allow-Origin *;
-        add_header Cache-Control "no-cache, no-store, must-revalidate";
-        try_files /udpserver/online_app =404;
-    }
-    
-    location /udpserver/ {
-        deny all;
-        return 403;
-    }
-}
+[Install]
+WantedBy=multi-user.target
 EOF
+
+    # Create tracker script
+    cat > /usr/local/bin/hysteria-tracker.sh << 'TRACKEREOF'
+#!/bin/bash
+
+CONFIG_DIR="/etc/hysteria"
+CONFIG_FILE="$CONFIG_DIR/config.json"
+USER_DB="$CONFIG_DIR/udpusers.db"
+ONLINE_USERS_FILE="$CONFIG_DIR/online_users.log"
+
+echo "Starting Hysteria Connection Tracker..."
+echo "Log file: $ONLINE_USERS_FILE"
+echo "Database: $USER_DB"
+
+# Get port
+HYSTERIA_PORT=$(jq -r '.listen' "$CONFIG_FILE" 2>/dev/null | sed 's/^://' | cut -d: -f1)
+[[ -z "$HYSTERIA_PORT" ]] && HYSTERIA_PORT="36712"
+
+echo "Monitoring port: $HYSTERIA_PORT"
+echo "Auto-disconnect after 3 minutes inactivity"
+
+# Clear stale connections
+sqlite3 "$USER_DB" "UPDATE online_sessions SET status='offline', disconnect_time=datetime('now') WHERE status='online';"
+
+# Background timeout checker
+(
+    while true; do
+        sleep 30
+        timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+        sqlite3 "$USER_DB" "UPDATE online_sessions SET status='offline', disconnect_time='$timestamp' WHERE status='online' AND datetime(connect_time) < datetime('now', '-3 minutes');" 2>/dev/null
+    done
+) &
+timeout_pid=$!
+
+# Trap to cleanup on exit
+cleanup() {
+    echo "Shutting down tracker..."
+    kill $timeout_pid 2>/dev/null
+    exit 0
+}
+trap cleanup SIGTERM SIGINT
+
+# Monitor logs
+journalctl -u hysteria-server -f -n 0 --no-pager 2>/dev/null | while read -r line; do
+    timestamp=$(date '+%Y-%m-%d %H:%M:%S')
     
-    # Enable the site
-    ln -sf /etc/nginx/sites-available/udp-status /etc/nginx/sites-enabled/
+    ip=$(echo "$line" | grep -oP '\[src:\K[0-9.]+(?=:)' | head -1)
+    [[ -z "$ip" ]] && continue
     
-    # Test nginx config
-    nginx -t
-    if [[ $? -eq 0 ]]; then
-        systemctl reload nginx
-        systemctl enable nginx
+    port=$(echo "$line" | grep -oP '\[src:[0-9.]+:\K[0-9]+(?=\])' | head -1)
+    
+    (
+        flock -x 200
+        session_id=$(sqlite3 "$USER_DB" "SELECT session_id FROM online_sessions WHERE ip_address='$ip' AND status='online' LIMIT 1;" 2>/dev/null)
         
-        local server_ip=$(curl -s ifconfig.me 2>/dev/null || hostname -I | awk '{print $1}')
-        echo -e "${GREEN}✓ Web server configured successfully!${NC}"
-        echo -e "${CYAN}Access URLs:${NC}"
-        echo -e "${CYAN}  - http://$server_ip:81/udpserver/online${NC}"
-        echo -e "${CYAN}  - http://$server_ip:81/udpserver/online_app${NC}"
-    else
-        echo -e "${RED}✗ Nginx configuration error${NC}"
-    fi
+        if [[ -z "$session_id" ]]; then
+            session_id="${ip}_${port}_$(date +%s%N)"
+            username="user_${ip}"
+            sqlite3 "$USER_DB" "INSERT INTO online_sessions (session_id, username, ip_address, port, connect_time, status) VALUES ('$session_id', '$username', '$ip', ${port:-0}, '$timestamp', 'online');" 2>/dev/null
+            echo "$timestamp - $username ($ip:${port:-unknown}) connected [Session: $session_id]" >> "$ONLINE_USERS_FILE"
+            echo "[CONNECT] $username from $ip:${port:-unknown}"
+        else
+            sqlite3 "$USER_DB" "UPDATE online_sessions SET connect_time='$timestamp' WHERE session_id='$session_id';" 2>/dev/null
+        fi
+    ) 200>/var/lock/udp_sessions.lock
+done
+
+kill $timeout_pid 2>/dev/null
+TRACKEREOF
+
+    chmod +x /usr/local/bin/hysteria-tracker.sh
+    
+    # Reload systemd
+    systemctl daemon-reload
+    
+    # Enable auto-start
+    systemctl enable hysteria-tracker
+    
+    echo -e "${GREEN}✓ Hysteria-tracker service created${NC}"
 }
 
-# Check monitoring status
+# Check monitor status
 check_monitor_status() {
     echo -e "\n${BLUE}═══ Monitoring Status ═══${NC}"
     
-    # Check online monitor
+    # Online monitor
     if [[ -f "$MONITOR_PID_FILE" ]]; then
-        local mon_pid=$(cat "$MONITOR_PID_FILE")
-        if ps -p "$mon_pid" > /dev/null 2>&1; then
-            echo -e "${GREEN}✓ Online monitor is RUNNING (PID: $mon_pid)${NC}"
+        local pid=$(cat "$MONITOR_PID_FILE")
+        if ps -p "$pid" > /dev/null 2>&1; then
+            echo -e "${GREEN}✓ Online monitor is RUNNING (PID: $pid)${NC}"
         else
-            echo -e "${RED}✗ Online monitor is NOT running${NC}"
+            echo -e "${RED}✗ Online monitor is NOT RUNNING${NC}"
         fi
     else
-        echo -e "${RED}✗ Online monitor is NOT running${NC}"
+        echo -e "${RED}✗ Online monitor is NOT RUNNING${NC}"
     fi
     
-    # Check connection tracker
-    if [[ -f "$TRACKER_PID_FILE" ]]; then
-        local trk_pid=$(cat "$TRACKER_PID_FILE")
-        if ps -p "$trk_pid" > /dev/null 2>&1; then
-            echo -e "${GREEN}✓ Connection tracker is RUNNING (PID: $trk_pid)${NC}"
-        else
-            echo -e "${RED}✗ Connection tracker is NOT running${NC}"
-        fi
+    # Connection tracker (systemd)
+    if systemctl is-active hysteria-tracker >/dev/null 2>&1; then
+        echo -e "${GREEN}✓ Connection tracker is RUNNING (systemd service)${NC}"
     else
-        echo -e "${RED}✗ Connection tracker is NOT running${NC}"
+        echo -e "${RED}✗ Connection tracker is NOT RUNNING${NC}"
     fi
     
-    # Check nginx
-    if systemctl is-active nginx >/dev/null 2>&1; then
-        echo -e "${GREEN}✓ Nginx is running${NC}"
-    else
-        echo -e "${RED}✗ Nginx is not running${NC}"
-    fi
-    
-    # Check Hysteria service
+    # Hysteria server
     if systemctl is-active hysteria-server >/dev/null 2>&1; then
         echo -e "${GREEN}✓ Hysteria server is running${NC}"
     else
-        echo -e "${RED}✗ Hysteria server is not running${NC}"
+        echo -e "${RED}✗ Hysteria server is NOT running${NC}"
     fi
     
-    # Show current online count
-    if [[ -f "$WEB_STATUS_FILE" ]]; then
-        local count=$(cat "$WEB_STATUS_FILE")
-        echo -e "\n${CYAN}Current online users: ${GREEN}$count${NC}"
+    # Nginx
+    if systemctl is-active nginx >/dev/null 2>&1; then
+        echo -e "${GREEN}✓ Nginx is running${NC}"
+    else
+        echo -e "${YELLOW}⚠ Nginx is not running${NC}"
     fi
     
-    # Show web endpoints
-    local server_ip=$(curl -s ifconfig.me 2>/dev/null || hostname -I | awk '{print $1}')
-    echo -e "\n${BLUE}═══ Web Endpoints ═══${NC}"
-    echo -e "${CYAN}http://$server_ip:81/udpserver/online${NC}"
-    echo -e "${CYAN}http://$server_ip:81/udpserver/online_app${NC}"
+    # Current online users
+    local online_count=$(sqlite3 "$USER_DB" "SELECT COUNT(*) FROM online_sessions WHERE status='online';" 2>/dev/null || echo "0")
+    echo -e "${CYAN}Current online users: $online_count${NC}"
 }
 
-# User management functions
+# Show online users
+show_online_users() {
+    echo -e "\n${BLUE}═══ Online Users ═══${NC}"
+    
+    local online_count=$(sqlite3 "$USER_DB" "SELECT COUNT(DISTINCT session_id) FROM online_sessions WHERE status='online';" 2>/dev/null || echo "0")
+    echo -e "${CYAN}Total online: $online_count${NC}\n"
+    
+    if [[ $online_count -gt 0 ]]; then
+        echo -e "${GREEN}Username${NC}\t\t${GREEN}IP Address${NC}\t\t${GREEN}Connected At${NC}\t${GREEN}Duration${NC}"
+        echo "─────────────────────────────────────────────────────────────────────────"
+        
+        sqlite3 "$USER_DB" "
+            SELECT 
+                username,
+                ip_address,
+                strftime('%Y-%m-%d %H:%M:%S', connect_time) as conn_time,
+                CAST((julianday('now') - julianday(connect_time)) * 24 * 60 AS INTEGER) || ' min' as duration
+            FROM online_sessions 
+            WHERE status='online'
+            ORDER BY connect_time DESC;
+        " 2>/dev/null | while IFS='|' read username ip conn_time duration; do
+            printf "%-20s %-15s %-20s %s\n" "$username" "$ip" "$conn_time" "$duration"
+        done
+    else
+        echo -e "${YELLOW}No users currently online${NC}"
+    fi
+}
+
+# Show user history
+show_user_history() {
+    echo -e "\n${BLUE}═══ User Connection History ═══${NC}"
+    echo -e "${CYAN}Last 20 connections:${NC}\n"
+    
+    echo -e "${GREEN}Username${NC}\t\t${GREEN}IP Address${NC}\t\t${GREEN}Connect Time${NC}\t\t${GREEN}Disconnect Time${NC}\t${GREEN}Status${NC}"
+    echo "────────────────────────────────────────────────────────────────────────────────────────────"
+    
+    sqlite3 "$USER_DB" "
+        SELECT 
+            username,
+            ip_address,
+            strftime('%Y-%m-%d %H:%M:%S', connect_time) as conn,
+            COALESCE(strftime('%Y-%m-%d %H:%M:%S', disconnect_time), 'N/A') as disconn,
+            status
+        FROM online_sessions 
+        ORDER BY connect_time DESC 
+        LIMIT 20;
+    " 2>/dev/null | while IFS='|' read username ip conn disconn status; do
+        if [[ "$status" == "online" ]]; then
+            printf "%-20s %-15s %-20s %-20s \033[0;32m%s\033[0m\n" "$username" "$ip" "$conn" "$disconn" "$status"
+        else
+            printf "%-20s %-15s %-20s %-20s %s\n" "$username" "$ip" "$conn" "$disconn" "$status"
+        fi
+    done
+}
+
+# Setup web server
+setup_web_server() {
+    echo -e "\n${BLUE}Setting up web server for online status...${NC}"
+    
+    # Create nginx config
+    cat > /etc/nginx/sites-available/udp-status << 'NGINXEOF'
+server {
+    listen 80;
+    server_name _;
+    
+    root /var/www/html;
+    
+    location /udpserver/ {
+        autoindex on;
+        add_header Access-Control-Allow-Origin *;
+        add_header Cache-Control "no-cache, no-store, must-revalidate";
+    }
+}
+NGINXEOF
+
+    # Enable site
+    ln -sf /etc/nginx/sites-available/udp-status /etc/nginx/sites-enabled/udp-status
+    
+    # Create web directory
+    mkdir -p "$WEB_DIR"
+    chmod 755 "$WEB_DIR"
+    
+    # Create initial files
+    echo "0" > "$WEB_STATUS_FILE"
+    echo '{"onlines":"0","limite":"2500"}' > "$WEB_APP_FILE"
+    chmod 644 "$WEB_STATUS_FILE" "$WEB_APP_FILE"
+    
+    # Test nginx config
+    nginx -t
+    
+    # Reload nginx
+    systemctl reload nginx
+    
+    echo -e "${GREEN}✓ Web server configured${NC}"
+    echo -e "${CYAN}Access at: http://YOUR_SERVER_IP/udpserver/online${NC}"
+    echo -e "${CYAN}JSON API: http://YOUR_SERVER_IP/udpserver/online_app${NC}"
+}
+
+# User management
 add_user() {
-    echo -e "\n${BLUE}Enter username:${NC}"
+    echo -e "\n${BLUE}Add New User${NC}"
+    echo -e "${BLUE}Enter username:${NC}"
     read -r username
     echo -e "${BLUE}Enter password:${NC}"
     read -r password
     
     sqlite3 "$USER_DB" "INSERT INTO users (username, password) VALUES ('$username', '$password');" 2>/dev/null
+    
     if [[ $? -eq 0 ]]; then
         echo -e "${GREEN}✓ User $username added successfully${NC}"
         update_userpass_config
@@ -543,7 +523,11 @@ uninstall_server() {
     if [[ "$confirm" == "yes" ]]; then
         echo -e "${BLUE}Uninstalling...${NC}"
         stop_online_monitor
-        stop_connection_tracker
+        systemctl stop hysteria-tracker
+        systemctl disable hysteria-tracker
+        rm -f /etc/systemd/system/hysteria-tracker.service
+        rm -f /usr/local/bin/hysteria-tracker.sh
+        systemctl daemon-reload
         systemctl stop hysteria-server
         systemctl disable hysteria-server
         rm -f "$SYSTEMD_SERVICE"
@@ -564,8 +548,8 @@ uninstall_server() {
 show_banner() {
     clear
     echo -e "${BLUE}═══════════════════════════════════════════${NC}"
-    echo -e "${CYAN}   UDP Manager with Background Monitoring${NC}"
-    echo -e "${GREEN}   Simple Loop Style - v2.0${NC}"
+    echo -e "${CYAN}   UDP Manager with Systemd Integration${NC}"
+    echo -e "${GREEN}   Activity-Based Tracking - v3.0${NC}"
     echo -e "${YELLOW}   (c) 2025 - @sansoe2021${NC}"
     echo -e "${BLUE}═══════════════════════════════════════════${NC}"
 }
@@ -609,7 +593,20 @@ show_banner
 if [[ ! -f "$MONITOR_PID_FILE" ]] || ! ps -p "$(cat $MONITOR_PID_FILE 2>/dev/null)" > /dev/null 2>&1; then
     echo -e "${YELLOW}Auto-starting online monitor...${NC}"
     start_online_monitor
-    sleep 2
+    sleep 1
+fi
+
+# Auto-start connection tracker if not running
+if ! systemctl is-active hysteria-tracker >/dev/null 2>&1; then
+    echo -e "${YELLOW}Auto-starting connection tracker...${NC}"
+    
+    # Check if service exists, if not create it
+    if [[ ! -f "/etc/systemd/system/hysteria-tracker.service" ]]; then
+        setup_tracker_service
+    fi
+    
+    systemctl start hysteria-tracker
+    sleep 1
 fi
 
 while true; do
