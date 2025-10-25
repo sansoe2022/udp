@@ -817,10 +817,7 @@ perform_install() {
         echo -e "$(tgreen)═══════════════════════════════════════════════════════$(treset)"
         echo
         echo -e "$(tbold)Quick Start:$(treset)"
-        echo -e "  1. Run: $(tblue)udp$(treset) to access the management menu"
-        echo -e "  2. Select option $(tyellow)12$(treset) to online link"
-        echo -e "  3. Select option $(tyellow)13$(treset) to change domain"
-        echo -e "  4. Select option $(tyellow)5$(treset) to view online users"
+        echo -e "  Run: $(tblue)udp$(treset) to access the management menu"
         echo
         echo -e "$(tbold)Features:$(treset)"
         echo -e "  ✓ Multi-user online tracking"
