@@ -217,27 +217,30 @@ track_connections() {
 start_connection_tracker() {
     echo -e "${BLUE}Starting detailed connection tracker...${NC}"
     
-    stop_connection_tracker
+    # Use systemd service instead
+    systemctl start hysteria-tracker
     
-    (track_connections) &
-    echo $! > "$TRACKER_PID_FILE"
-    
-    echo -e "${GREEN}✓ Connection tracker started (PID: $(cat $TRACKER_PID_FILE))${NC}"
-    echo -e "${CYAN}View logs: tail -f $ONLINE_USERS_FILE${NC}"
+    if systemctl is-active hysteria-tracker >/dev/null 2>&1; then
+        echo -e "${GREEN}✓ Connection tracker started (systemd service)${NC}"
+        echo -e "${CYAN}View logs: journalctl -u hysteria-tracker -f${NC}"
+    else
+        echo -e "${RED}✗ Failed to start tracker${NC}"
+    fi
 }
 
 # Stop connection tracker
 stop_connection_tracker() {
-    if [[ -f "$TRACKER_PID_FILE" ]]; then
-        local pid=$(cat "$TRACKER_PID_FILE")
-        if ps -p "$pid" > /dev/null 2>&1; then
-            kill "$pid" 2>/dev/null
-            echo -e "${GREEN}✓ Stopped connection tracker (PID: $pid)${NC}"
-        fi
-        rm -f "$TRACKER_PID_FILE"
+    echo -e "${BLUE}Stopping connection tracker...${NC}"
+    
+    systemctl stop hysteria-tracker
+    
+    if ! systemctl is-active hysteria-tracker >/dev/null 2>&1; then
+        echo -e "${GREEN}✓ Connection tracker stopped${NC}"
+    else
+        echo -e "${RED}✗ Failed to stop tracker${NC}"
     fi
-    pkill -f "journalctl -u hysteria-server -f" 2>/dev/null
 }
+
 
 # Show online users
 show_online_users() {
