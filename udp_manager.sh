@@ -9,7 +9,6 @@ ONLINE_USERS_FILE="$CONFIG_DIR/online_users.log"
 WEB_DIR="/var/www/html/udpserver"
 WEB_STATUS_FILE="$WEB_DIR/online"
 WEB_APP_FILE="$WEB_DIR/online_app"
-MONITOR_PID_FILE="$CONFIG_DIR/.monitor_pid"
 
 mkdir -p "$CONFIG_DIR"
 mkdir -p "/var/log/hysteria"
@@ -23,9 +22,9 @@ GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 CYAN='\033[0;36m'
-NC='\033[0m' # No Color
+NC='\033[0m'
 
-# Initialize database with online_sessions table
+# Initialize database
 init_database() {
     sqlite3 "$USER_DB" "CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY, username TEXT UNIQUE, password TEXT);"
     sqlite3 "$USER_DB" "CREATE TABLE IF NOT EXISTS online_sessions (
@@ -58,12 +57,46 @@ update_userpass_config() {
     jq ".auth.config = [$user_array]" "$CONFIG_FILE" > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" "$CONFIG_FILE"
 }
 
-fun_online() {
-    # Database-based counting (primary method for QUIC)
-    local _onli=0
-    if [[ -f "$USER_DB" ]]; then
-        _onli=$(sqlite3 "$USER_DB" "SELECT COUNT(DISTINCT session_id) FROM online_sessions WHERE status='online' AND datetime(connect_time) > datetime('now', '-10 minutes');" 2>/dev/null || echo "0")
-    fi
+# Setup online monitor systemd service
+setup_online_monitor_service() {
+    echo -e "${BLUE}Setting up online-monitor service...${NC}"
+    
+    # Create service file
+    cat > /etc/systemd/system/hysteria-online-monitor.service << 'EOF'
+[Unit]
+Description=Hysteria Online Users Monitor
+After=hysteria-server.service hysteria-tracker.service
+Requires=hysteria-server.service
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/etc/hysteria
+ExecStart=/usr/local/bin/hysteria-online-monitor.sh
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    # Create monitor script
+    cat > /usr/local/bin/hysteria-online-monitor.sh << 'MONITOREOF'
+#!/bin/bash
+
+CONFIG_DIR="/etc/hysteria"
+USER_DB="$CONFIG_DIR/udpusers.db"
+WEB_DIR="/var/www/html/udpserver"
+WEB_STATUS_FILE="$WEB_DIR/online"
+WEB_APP_FILE="$WEB_DIR/online_app"
+
+echo "Starting Online Users Monitor..."
+
+while true; do
+    # Database-based counting
+    _onli=$(sqlite3 "$USER_DB" "SELECT COUNT(DISTINCT session_id) FROM online_sessions WHERE status='online' AND datetime(connect_time) > datetime('now', '-10 minutes');" 2>/dev/null || echo "0")
     
     # Ensure non-negative
     [[ $_onli -lt 0 ]] && _onli=0
@@ -78,44 +111,24 @@ fun_online() {
     
     # Set permissions
     chmod 644 "$WEB_STATUS_FILE" "$WEB_APP_FILE" 2>/dev/null
+    
+    # Update every 10 seconds for faster response
+    sleep 10
+done
+MONITOREOF
+
+    chmod +x /usr/local/bin/hysteria-online-monitor.sh
+    
+    # Reload systemd
+    systemctl daemon-reload
+    
+    # Enable auto-start
+    systemctl enable hysteria-online-monitor
+    
+    echo -e "${GREEN}✓ Online-monitor service created${NC}"
 }
 
-# Background monitoring loop
-start_online_monitor() {
-    echo -e "${BLUE}Starting online monitor (background loop)...${NC}"
-    
-    # Stop existing monitor if running
-    stop_online_monitor
-    
-    # Start background loop
-    (
-        while true; do
-            fun_online > /dev/null 2>&1
-            sleep 15s
-        done
-    ) &
-    
-    # Save PID
-    echo $! > "$MONITOR_PID_FILE"
-    
-    echo -e "${GREEN}✓ Online monitor started (PID: $(cat $MONITOR_PID_FILE))${NC}"
-    echo -e "${CYAN}Updates every 15 seconds${NC}"
-    echo -e "${CYAN}Files: $WEB_STATUS_FILE and $WEB_APP_FILE${NC}"
-}
-
-# Stop background monitor
-stop_online_monitor() {
-    if [[ -f "$MONITOR_PID_FILE" ]]; then
-        local pid=$(cat "$MONITOR_PID_FILE")
-        if ps -p "$pid" > /dev/null 2>&1; then
-            kill "$pid" 2>/dev/null
-            echo -e "${GREEN}✓ Stopped online monitor (PID: $pid)${NC}"
-        fi
-        rm -f "$MONITOR_PID_FILE"
-    fi
-}
-
-# Setup tracker systemd service
+# Setup tracker systemd service with faster timeout
 setup_tracker_service() {
     echo -e "${BLUE}Setting up hysteria-tracker service...${NC}"
     
@@ -140,7 +153,7 @@ StandardError=journal
 WantedBy=multi-user.target
 EOF
 
-    # Create tracker script
+    # Create tracker script with 30 second timeout
     cat > /usr/local/bin/hysteria-tracker.sh << 'TRACKEREOF'
 #!/bin/bash
 
@@ -158,17 +171,19 @@ HYSTERIA_PORT=$(jq -r '.listen' "$CONFIG_FILE" 2>/dev/null | sed 's/^://' | cut 
 [[ -z "$HYSTERIA_PORT" ]] && HYSTERIA_PORT="36712"
 
 echo "Monitoring port: $HYSTERIA_PORT"
-echo "Auto-disconnect after 3 minutes inactivity"
+echo "Auto-disconnect after 30 seconds inactivity"
 
 # Clear stale connections
 sqlite3 "$USER_DB" "UPDATE online_sessions SET status='offline', disconnect_time=datetime('now') WHERE status='online';"
 
-# Background timeout checker
+# Background timeout checker - runs every 15 seconds
 (
     while true; do
-        sleep 30
+        sleep 15
         timestamp=$(date '+%Y-%m-%d %H:%M:%S')
-        sqlite3 "$USER_DB" "UPDATE online_sessions SET status='offline', disconnect_time='$timestamp' WHERE status='online' AND datetime(connect_time) < datetime('now', '-3 minutes');" 2>/dev/null
+        
+        # Mark offline after 30 seconds of no activity
+        sqlite3 "$USER_DB" "UPDATE online_sessions SET status='offline', disconnect_time='$timestamp' WHERE status='online' AND datetime(connect_time) < datetime('now', '-30 seconds');" 2>/dev/null
     done
 ) &
 timeout_pid=$!
@@ -220,7 +235,43 @@ TRACKEREOF
     echo -e "${GREEN}✓ Hysteria-tracker service created${NC}"
 }
 
-# Start connection tracker (uses systemd service)
+# Start online monitor
+start_online_monitor() {
+    echo -e "${BLUE}Starting online monitor...${NC}"
+    
+    # Check if service exists
+    if [[ ! -f "/etc/systemd/system/hysteria-online-monitor.service" ]]; then
+        echo -e "${YELLOW}Creating hysteria-online-monitor systemd service...${NC}"
+        setup_online_monitor_service
+    fi
+    
+    # Start service
+    systemctl start hysteria-online-monitor
+    
+    if systemctl is-active hysteria-online-monitor >/dev/null 2>&1; then
+        echo -e "${GREEN}✓ Online monitor started (systemd service)${NC}"
+        echo -e "${CYAN}Service: hysteria-online-monitor${NC}"
+        echo -e "${CYAN}Updates every 10 seconds${NC}"
+    else
+        echo -e "${RED}✗ Failed to start online monitor${NC}"
+        echo -e "${YELLOW}Check status: systemctl status hysteria-online-monitor${NC}"
+    fi
+}
+
+# Stop online monitor
+stop_online_monitor() {
+    echo -e "${BLUE}Stopping online monitor...${NC}"
+    
+    systemctl stop hysteria-online-monitor
+    
+    if ! systemctl is-active hysteria-online-monitor >/dev/null 2>&1; then
+        echo -e "${GREEN}✓ Online monitor stopped${NC}"
+    else
+        echo -e "${RED}✗ Failed to stop online monitor${NC}"
+    fi
+}
+
+# Start connection tracker
 start_connection_tracker() {
     echo -e "${BLUE}Starting connection tracker...${NC}"
     
@@ -236,8 +287,7 @@ start_connection_tracker() {
     if systemctl is-active hysteria-tracker >/dev/null 2>&1; then
         echo -e "${GREEN}✓ Connection tracker started (systemd service)${NC}"
         echo -e "${CYAN}Service: hysteria-tracker${NC}"
-        echo -e "${CYAN}View logs: journalctl -u hysteria-tracker -f${NC}"
-        echo -e "${CYAN}Connection log: tail -f $ONLINE_USERS_FILE${NC}"
+        echo -e "${CYAN}Disconnect detection: 30 seconds${NC}"
     else
         echo -e "${RED}✗ Failed to start tracker${NC}"
         echo -e "${YELLOW}Check status: systemctl status hysteria-tracker${NC}"
@@ -261,14 +311,9 @@ stop_connection_tracker() {
 check_monitor_status() {
     echo -e "\n${BLUE}═══ Monitoring Status ═══${NC}"
     
-    # Online monitor
-    if [[ -f "$MONITOR_PID_FILE" ]]; then
-        local pid=$(cat "$MONITOR_PID_FILE")
-        if ps -p "$pid" > /dev/null 2>&1; then
-            echo -e "${GREEN}✓ Online monitor is RUNNING (PID: $pid)${NC}"
-        else
-            echo -e "${RED}✗ Online monitor is NOT RUNNING${NC}"
-        fi
+    # Online monitor (systemd)
+    if systemctl is-active hysteria-online-monitor >/dev/null 2>&1; then
+        echo -e "${GREEN}✓ Online monitor is RUNNING (systemd service)${NC}"
     else
         echo -e "${RED}✗ Online monitor is NOT RUNNING${NC}"
     fi
@@ -276,6 +321,7 @@ check_monitor_status() {
     # Connection tracker (systemd)
     if systemctl is-active hysteria-tracker >/dev/null 2>&1; then
         echo -e "${GREEN}✓ Connection tracker is RUNNING (systemd service)${NC}"
+        echo -e "${CYAN}  Disconnect detection: 30 seconds${NC}"
     else
         echo -e "${RED}✗ Connection tracker is NOT RUNNING${NC}"
     fi
@@ -365,48 +411,31 @@ show_user_history() {
 setup_web_server() {
     echo -e "\n${BLUE}Setting up web server for online status...${NC}"
     
-    # Check if nginx is installed
     if ! command -v nginx &> /dev/null; then
         echo -e "${YELLOW}Nginx not found. Installing...${NC}"
-        apt update
-        apt install -y nginx
-        
-        if [[ $? -ne 0 ]]; then
-            echo -e "${RED}✗ Failed to install nginx${NC}"
-            return 1
-        fi
-        
+        apt update && apt install -y nginx
         systemctl start nginx
         systemctl enable nginx
-        echo -e "${GREEN}✓ Nginx installed${NC}"
     fi
     
-    # Create nginx directories if they don't exist
-    mkdir -p /etc/nginx/sites-available
-    mkdir -p /etc/nginx/sites-enabled
+    mkdir -p /etc/nginx/sites-available /etc/nginx/sites-enabled
     
-    # Check if sites-enabled is included in nginx.conf
     if ! grep -q "sites-enabled" /etc/nginx/nginx.conf; then
-        echo -e "${YELLOW}Adding sites-enabled to nginx.conf...${NC}"
         sed -i '/include \/etc\/nginx\/conf.d\/\*.conf;/a \    include /etc/nginx/sites-enabled/*;' /etc/nginx/nginx.conf
     fi
     
-    # Create nginx config with proper content types
     cat > /etc/nginx/sites-available/udp-status << 'NGINXEOF'
 server {
     listen 80;
     server_name _;
-    
     root /var/www/html;
     
-    # Main location
     location /udpserver/ {
         autoindex on;
         add_header Access-Control-Allow-Origin *;
         add_header Cache-Control "no-cache, no-store, must-revalidate";
     }
     
-    # Plain text API endpoint
     location = /udpserver/online {
         default_type text/plain;
         add_header Content-Type "text/plain; charset=utf-8";
@@ -414,7 +443,6 @@ server {
         add_header Cache-Control "no-cache, no-store, must-revalidate";
     }
     
-    # JSON API endpoint
     location = /udpserver/online_app {
         default_type application/json;
         add_header Content-Type "application/json; charset=utf-8";
@@ -424,22 +452,15 @@ server {
 }
 NGINXEOF
 
-    # Remove default site if exists
     rm -f /etc/nginx/sites-enabled/default
-    
-    # Enable site
     ln -sf /etc/nginx/sites-available/udp-status /etc/nginx/sites-enabled/udp-status
     
-    # Create web directory
     mkdir -p "$WEB_DIR"
     chmod 755 "$WEB_DIR"
-    
-    # Create initial files
     echo "0" > "$WEB_STATUS_FILE"
     echo '{"onlines":"0","limite":"2500"}' > "$WEB_APP_FILE"
     chmod 644 "$WEB_STATUS_FILE" "$WEB_APP_FILE"
     
-    # Create HTML dashboard
     cat > "$WEB_DIR/index.html" << 'HTMLEOF'
 <!DOCTYPE html>
 <html>
@@ -448,11 +469,7 @@ NGINXEOF
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <style>
-        * {
-            margin: 0;
-            padding: 0;
-            box-sizing: border-box;
-        }
+        * { margin: 0; padding: 0; box-sizing: border-box; }
         body {
             font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
             background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
@@ -471,16 +488,8 @@ NGINXEOF
             max-width: 500px;
             width: 100%;
         }
-        h1 {
-            color: #333;
-            margin-bottom: 10px;
-            font-size: 28px;
-        }
-        .subtitle {
-            color: #666;
-            font-size: 14px;
-            margin-bottom: 40px;
-        }
+        h1 { color: #333; margin-bottom: 10px; font-size: 28px; }
+        .subtitle { color: #666; font-size: 14px; margin-bottom: 40px; }
         .count-wrapper {
             background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
             padding: 40px;
@@ -509,20 +518,14 @@ NGINXEOF
             padding-top: 30px;
             border-top: 1px solid #e0e0e0;
         }
-        .info-item {
-            text-align: center;
-        }
+        .info-item { text-align: center; }
         .info-label {
             color: #999;
             font-size: 12px;
             margin-bottom: 5px;
             text-transform: uppercase;
         }
-        .info-value {
-            color: #333;
-            font-size: 16px;
-            font-weight: bold;
-        }
+        .info-value { color: #333; font-size: 16px; font-weight: bold; }
         .status {
             display: inline-block;
             width: 12px;
@@ -536,11 +539,7 @@ NGINXEOF
             0%, 100% { opacity: 1; }
             50% { opacity: 0.5; }
         }
-        .footer {
-            margin-top: 30px;
-            color: #999;
-            font-size: 12px;
-        }
+        .footer { margin-top: 30px; color: #999; font-size: 12px; }
         .api-links {
             margin-top: 20px;
             padding: 20px;
@@ -555,21 +554,17 @@ NGINXEOF
             font-size: 13px;
             transition: color 0.3s;
         }
-        .api-link:hover {
-            color: #764ba2;
-        }
+        .api-link:hover { color: #764ba2; }
     </style>
 </head>
 <body>
     <div class="container">
         <h1>UDP Server Monitor</h1>
         <p class="subtitle"><span class="status"></span>Live Status</p>
-        
         <div class="count-wrapper">
             <div class="count" id="count">--</div>
             <div class="label">Online Users</div>
         </div>
-        
         <div class="info">
             <div class="info-item">
                 <div class="info-label">Update</div>
@@ -584,18 +579,13 @@ NGINXEOF
                 <div class="info-value" style="color: #4caf50;">Active</div>
             </div>
         </div>
-        
         <div class="api-links">
             <strong style="color: #333; font-size: 14px;">API Endpoints:</strong>
             <a href="/udpserver/online" class="api-link" target="_blank">📊 Plain Text API</a>
             <a href="/udpserver/online_app" class="api-link" target="_blank">📋 JSON API</a>
         </div>
-        
-        <div class="footer">
-            Auto-refresh every 5 seconds
-        </div>
+        <div class="footer">Auto-refresh every 5 seconds</div>
     </div>
-    
     <script>
         async function updateCount() {
             try {
@@ -605,10 +595,8 @@ NGINXEOF
                 document.getElementById('limit').textContent = data.limite;
             } catch (error) {
                 document.getElementById('count').textContent = 'Error';
-                console.error('Failed to fetch data:', error);
             }
         }
-        
         updateCount();
         setInterval(updateCount, 5000);
     </script>
@@ -618,27 +606,12 @@ HTMLEOF
 
     chmod 644 "$WEB_DIR/index.html"
     
-    # Test nginx config
-    echo -e "${CYAN}Testing nginx configuration...${NC}"
-    nginx -t
+    nginx -t && systemctl reload nginx
     
-    if [[ $? -eq 0 ]]; then
-        # Reload nginx
-        systemctl reload nginx
-        echo -e "${GREEN}✓ Web server configured successfully${NC}"
-        
-        # Get server IP
-        local server_ip=$(curl -s ifconfig.me 2>/dev/null || hostname -I | awk '{print $1}')
-        echo -e "${CYAN}─────────────────────────────────────${NC}"
-        echo -e "${GREEN}Access URLs:${NC}"
-        echo -e "${CYAN}Dashboard:  http://${server_ip}/udpserver/${NC}"
-        echo -e "${CYAN}Text API:   http://${server_ip}/udpserver/online${NC}"
-        echo -e "${CYAN}JSON API:   http://${server_ip}/udpserver/online_app${NC}"
-        echo -e "${CYAN}─────────────────────────────────────${NC}"
-    else
-        echo -e "${RED}✗ Nginx configuration test failed${NC}"
-        return 1
-    fi
+    local server_ip=$(curl -s ifconfig.me 2>/dev/null || hostname -I | awk '{print $1}')
+    echo -e "${GREEN}✓ Web server configured${NC}"
+    echo -e "${CYAN}Dashboard: http://${server_ip}/udpserver/${NC}"
+    echo -e "${CYAN}API: http://${server_ip}/udpserver/online${NC}"
 }
 
 # User management
@@ -652,12 +625,11 @@ add_user() {
     sqlite3 "$USER_DB" "INSERT INTO users (username, password) VALUES ('$username', '$password');" 2>/dev/null
     
     if [[ $? -eq 0 ]]; then
-        echo -e "${GREEN}✓ User $username added successfully${NC}"
+        echo -e "${GREEN}✓ User $username added${NC}"
         update_userpass_config
         systemctl restart hysteria-server
-        echo -e "${YELLOW}Server restarted${NC}"
     else
-        echo -e "${RED}✗ Error: Failed to add user (may already exist)${NC}"
+        echo -e "${RED}✗ Failed (may already exist)${NC}"
     fi
 }
 
@@ -669,11 +641,11 @@ edit_user() {
     
     sqlite3 "$USER_DB" "UPDATE users SET password = '$password' WHERE username = '$username';" 2>/dev/null
     if [[ $? -eq 0 ]]; then
-        echo -e "${GREEN}✓ User $username updated successfully${NC}"
+        echo -e "${GREEN}✓ User updated${NC}"
         update_userpass_config
         systemctl restart hysteria-server
     else
-        echo -e "${RED}✗ Error: Failed to update user${NC}"
+        echo -e "${RED}✗ Failed${NC}"
     fi
 }
 
@@ -683,11 +655,11 @@ delete_user() {
     
     sqlite3 "$USER_DB" "DELETE FROM users WHERE username = '$username';" 2>/dev/null
     if [[ $? -eq 0 ]]; then
-        echo -e "${GREEN}✓ User $username deleted successfully${NC}"
+        echo -e "${GREEN}✓ User deleted${NC}"
         update_userpass_config
         systemctl restart hysteria-server
     else
-        echo -e "${RED}✗ Error: Failed to delete user${NC}"
+        echo -e "${RED}✗ Failed${NC}"
     fi
 }
 
@@ -708,12 +680,12 @@ change_domain() {
     echo -e "\n${BLUE}Enter new domain:${NC}"
     read -r domain
     jq ".server = \"$domain\"" "$CONFIG_FILE" > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" "$CONFIG_FILE"
-    echo -e "${GREEN}✓ Domain changed to $domain${NC}"
+    echo -e "${GREEN}✓ Domain changed${NC}"
     systemctl restart hysteria-server
 }
 
 change_obfs() {
-    echo -e "\n${BLUE}Enter new obfuscation string:${NC}"
+    echo -e "\n${BLUE}Enter new obfuscation:${NC}"
     read -r obfs
     jq ".obfs = \"$obfs\"" "$CONFIG_FILE" > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" "$CONFIG_FILE"
     echo -e "${GREEN}✓ Obfuscation changed${NC}"
@@ -724,7 +696,7 @@ change_up_speed() {
     echo -e "\n${BLUE}Enter new upload speed (Mbps):${NC}"
     read -r up_speed
     jq ".up_mbps = $up_speed | .up = \"$up_speed Mbps\"" "$CONFIG_FILE" > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" "$CONFIG_FILE"
-    echo -e "${GREEN}✓ Upload speed changed to $up_speed Mbps${NC}"
+    echo -e "${GREEN}✓ Upload speed changed${NC}"
     systemctl restart hysteria-server
 }
 
@@ -732,17 +704,15 @@ change_down_speed() {
     echo -e "\n${BLUE}Enter new download speed (Mbps):${NC}"
     read -r down_speed
     jq ".down_mbps = $down_speed | .down = \"$down_speed Mbps\"" "$CONFIG_FILE" > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" "$CONFIG_FILE"
-    echo -e "${GREEN}✓ Download speed changed to $down_speed Mbps${NC}"
+    echo -e "${GREEN}✓ Download speed changed${NC}"
     systemctl restart hysteria-server
 }
 
-# Cleanup functions
 cleanup_sessions() {
     local cleaned=$(sqlite3 "$USER_DB" "DELETE FROM online_sessions WHERE status='offline' AND datetime(disconnect_time) < datetime('now', '-7 days'); SELECT changes();" 2>/dev/null)
-    echo -e "${GREEN}✓ Cleaned up $cleaned old sessions (>7 days)${NC}"
+    echo -e "${GREEN}✓ Cleaned $cleaned old sessions${NC}"
 }
 
-# Server control
 restart_server() {
     systemctl restart hysteria-server
     echo -e "${GREEN}✓ Server restarted${NC}"
@@ -758,47 +728,36 @@ start_server() {
     echo -e "${GREEN}✓ Server started${NC}"
 }
 
-# Uninstall
 uninstall_server() {
-    echo -e "\n${RED}═══ WARNING: This will remove everything ═══${NC}"
+    echo -e "\n${RED}═══ WARNING ═══${NC}"
     echo -e "${YELLOW}Are you sure? (yes/no):${NC}"
     read -r confirm
     
     if [[ "$confirm" == "yes" ]]; then
-        echo -e "${BLUE}Uninstalling...${NC}"
-        stop_online_monitor
-        systemctl stop hysteria-tracker
-        systemctl disable hysteria-tracker
-        rm -f /etc/systemd/system/hysteria-tracker.service
-        rm -f /usr/local/bin/hysteria-tracker.sh
+        systemctl stop hysteria-online-monitor hysteria-tracker hysteria-server
+        systemctl disable hysteria-online-monitor hysteria-tracker hysteria-server
+        rm -f /etc/systemd/system/hysteria-{online-monitor,tracker,server}.service
+        rm -f /usr/local/bin/hysteria-{online-monitor,tracker}.sh
         systemctl daemon-reload
-        systemctl stop hysteria-server
-        systemctl disable hysteria-server
-        rm -f "$SYSTEMD_SERVICE"
-        systemctl daemon-reload
-        rm -rf "$CONFIG_DIR"
-        rm -rf "$WEB_DIR"
+        rm -rf "$CONFIG_DIR" "$WEB_DIR"
         rm -f /usr/local/bin/hysteria
-        rm -f /etc/nginx/sites-enabled/udp-status
-        rm -f /etc/nginx/sites-available/udp-status
+        rm -f /etc/nginx/sites-{enabled,available}/udp-status
         systemctl reload nginx
-        echo -e "${GREEN}✓ UDP server uninstalled${NC}"
+        echo -e "${GREEN}✓ Uninstalled${NC}"
     else
-        echo -e "${YELLOW}Uninstall cancelled${NC}"
+        echo -e "${YELLOW}Cancelled${NC}"
     fi
 }
 
-# Banner
 show_banner() {
     clear
     echo -e "${BLUE}═══════════════════════════════════════════${NC}"
-    echo -e "${CYAN}   UDP Manager with Systemd Integration${NC}"
-    echo -e "${GREEN}   Activity-Based Tracking - v3.0${NC}"
-    echo -e "${YELLOW}   (c) 2025 - @sansoe2021${NC}"
+    echo -e "${CYAN}   UDP Manager - Systemd Integration${NC}"
+    echo -e "${GREEN}   Fast Detection - v3.1${NC}"
+    echo -e "${YELLOW}   30s Timeout | 10s Updates${NC}"
     echo -e "${BLUE}═══════════════════════════════════════════${NC}"
 }
 
-# Menu
 show_menu() {
     echo -e "\n${BLUE}════════ UDP Manager Menu ════════${NC}"
     echo -e "${GREEN}1.  Add new user${NC}"
@@ -827,28 +786,22 @@ show_menu() {
     echo -n "Enter your choice: "
 }
 
-# Initialize database
 init_database
 
-# Main loop
 show_banner
 
-# Auto-start online monitor if not running
-if [[ ! -f "$MONITOR_PID_FILE" ]] || ! ps -p "$(cat $MONITOR_PID_FILE 2>/dev/null)" > /dev/null 2>&1; then
+# Auto-start online monitor
+if ! systemctl is-active hysteria-online-monitor >/dev/null 2>&1; then
     echo -e "${YELLOW}Auto-starting online monitor...${NC}"
-    start_online_monitor
+    [[ ! -f "/etc/systemd/system/hysteria-online-monitor.service" ]] && setup_online_monitor_service
+    systemctl start hysteria-online-monitor
     sleep 1
 fi
 
-# Auto-start connection tracker if not running
+# Auto-start connection tracker
 if ! systemctl is-active hysteria-tracker >/dev/null 2>&1; then
     echo -e "${YELLOW}Auto-starting connection tracker...${NC}"
-    
-    # Check if service exists, if not create it
-    if [[ ! -f "/etc/systemd/system/hysteria-tracker.service" ]]; then
-        setup_tracker_service
-    fi
-    
+    [[ ! -f "/etc/systemd/system/hysteria-tracker.service" ]] && setup_tracker_service
     systemctl start hysteria-tracker
     sleep 1
 fi
@@ -880,8 +833,7 @@ while true; do
         20) cleanup_sessions ;;
         21) uninstall_server ;;
         22) 
-            echo -e "${YELLOW}Exiting... (monitors will continue running in background)${NC}"
-            clear
+            echo -e "${YELLOW}Exiting (services continue in background)${NC}"
             exit 0
             ;;
         *) 
