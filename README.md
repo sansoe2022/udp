@@ -1,19 +1,27 @@
 # UDP Manager
-// Install
+## Install
 ```
 apt-get remove command-not-found -y && wget https://raw.githubusercontent.com/sansoe2022/udp/refs/heads/main/install_udp.sh && chmod +x install_udp.sh; ./install_udp.sh
 ```
 
-//Fix online web and api
+
+
+## Fix online web and api
 ```
-blabla
+wget https://raw.githubusercontent.com/sansoe2022/udp/refs/heads/main/fix_web_online.sh && chmod +x fix_web_online.sh; ./fix_web_online.sh
 ```
+
+
+
 # New Features
 - One click install
 - Dynamic domain and obfs
+- Support online web dashboard and api
+
 
 # Modified by
 San Kyaw Soe
+
 
 ## :octocat: Credits
 Original Script
